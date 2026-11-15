@@ -124,21 +124,42 @@ op_spec op_spec::matmul(tensor_id a, tensor_id w, tensor_id y) {
 
 result<std::unique_ptr<op_packet>> op_packet::create(const graph_owner & graph, const op_spec & spec) {
     using packet_result = result<std::unique_ptr<op_packet>>;
+    const bool matmul = spec.type_name == "MatMul";
+    const bool elementwise = spec.type_name == "ElementWiseAdd" || spec.type_name == "ElementWiseSubtract" ||
+                             spec.type_name == "ElementWiseMultiply" || spec.type_name == "ElementWiseDivide";
     if (spec.name.empty() || spec.name.size() > 128 || spec.name.find('\0') != std::string::npos ||
-        spec.package_name != "qti.aisw" || spec.type_name != "MatMul" ||
-        spec.inputs.size() != 2 || spec.outputs.size() != 1 || spec.parameters.size() != 2) {
-        return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Only the M0 MatMul recipe is supported"));
+        spec.package_name != "qti.aisw" || (!matmul && !elementwise) ||
+        spec.inputs.size() != 2 || spec.outputs.size() != 1 || spec.parameters.size() != (matmul ? 2 : 0)) {
+        return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Unsupported primitive recipe"));
     }
     const auto * a = graph.find_tensor(spec.inputs[0]);
     const auto * w = graph.find_tensor(spec.inputs[1]);
     const auto * y = graph.find_tensor(spec.outputs[0]);
-    if (!a || !w || !y || a->spec().role != QNN_TENSOR_TYPE_APP_WRITE || w->spec().role != QNN_TENSOR_TYPE_STATIC ||
-        y->spec().role != QNN_TENSOR_TYPE_APP_READ || a->spec().dimensions != std::vector<uint32_t>({2,4}) ||
-        w->spec().dimensions != std::vector<uint32_t>({3,4}) || y->spec().dimensions != std::vector<uint32_t>({2,3}) ||
-        spec.parameters[0].name != "transpose_in0" || spec.parameters[1].name != "transpose_in1" ||
-        spec.parameters[0].value.dataType != QNN_DATATYPE_BOOL_8 || spec.parameters[1].value.dataType != QNN_DATATYPE_BOOL_8 ||
-        spec.parameters[0].value.bool8Value != 0 || spec.parameters[1].value.bool8Value != 1) {
-        return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid MatMul IDs, shapes, roles or parameters"));
+    if (!a || !w || !y || (a->spec().role != QNN_TENSOR_TYPE_APP_WRITE && a->spec().role != QNN_TENSOR_TYPE_STATIC) ||
+        (w->spec().role != QNN_TENSOR_TYPE_APP_WRITE && w->spec().role != QNN_TENSOR_TYPE_STATIC) ||
+        y->spec().role != QNN_TENSOR_TYPE_APP_READ) {
+        return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid primitive IDs or roles"));
+    }
+    const auto & ad = a->spec().dimensions;
+    const auto & wd = w->spec().dimensions;
+    const auto & yd = y->spec().dimensions;
+    if (matmul) {
+        if (ad[1] != wd[1] || yd[0] != ad[0] || yd[1] != wd[0] ||
+            spec.parameters[0].name != "transpose_in0" || spec.parameters[1].name != "transpose_in1" ||
+            spec.parameters[0].value.dataType != QNN_DATATYPE_BOOL_8 || spec.parameters[1].value.dataType != QNN_DATATYPE_BOOL_8 ||
+            spec.parameters[0].value.bool8Value != 0 || spec.parameters[1].value.bool8Value != 1) {
+            return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid MatMul shapes or parameters"));
+        }
+        matmul_spec shape;
+        shape.m = ad[0]; shape.k = ad[1]; shape.n = wd[0];
+        auto admitted = graph.context()->runtime()->policy().admit_matmul(shape);
+        if (!admitted.ok()) { return packet_result::failure(admitted.error()); }
+    } else {
+        for (size_t i = 0; i < 2; ++i) {
+            if (yd[i] != ad[i] || (wd[i] != ad[i] && wd[i] != 1)) {
+                return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid elementwise broadcast"));
+            }
+        }
     }
     auto packet = std::unique_ptr<op_packet>(new op_packet());
     packet->spec_ = spec;
@@ -166,8 +187,6 @@ Qnn_OpConfig_t op_packet::descriptor() noexcept {
 
 status graph_owner::add_node(const op_spec & spec) {
     if (state_ != graph_state::building || node_added_) { return status::failure(host_error(error_stage::node_addition, "graphAddNode", "Graph is not accepting a node")); }
-    auto admitted = context_->runtime()->policy().admit_matmul(matmul_spec{});
-    if (!admitted.ok()) { return admitted; }
     auto packet = op_packet::create(*this, spec);
     if (!packet.ok()) { return status::failure(packet.error()); }
     auto config = packet.value()->descriptor();
@@ -181,7 +200,7 @@ status graph_owner::add_node(const op_spec & spec) {
 }
 
 status graph_owner::finalize() {
-    if (state_ != graph_state::building || !node_added_) { return status::failure(host_error(error_stage::graph_finalize, "graphFinalize", "Graph needs its MatMul node")); }
+    if (state_ != graph_state::building || !node_added_) { return status::failure(host_error(error_stage::graph_finalize, "graphFinalize", "Graph needs its primitive node")); }
     auto runtime = context_->runtime();
     auto code = runtime->domain()->call([&](const auto & api) { return api.graphFinalize(graph_, runtime->profile(), nullptr); });
     state_ = code == QNN_SUCCESS ? graph_state::finalized : graph_state::failed;
@@ -190,8 +209,8 @@ status graph_owner::finalize() {
 
 result<std::unique_ptr<execution_binding>> execution_binding::create(std::shared_ptr<const graph_owner> graph) {
     using binding_result = result<std::unique_ptr<execution_binding>>;
-    if (!graph || graph->state_ != graph_state::finalized || graph->input_ids_.size() != 1 || graph->output_ids_.size() != 1) {
-        return binding_result::failure(host_error(error_stage::io_binding, "binding.create", "Graph is not finalized with the M0 I/O"));
+    if (!graph || graph->state_ != graph_state::finalized || graph->input_ids_.empty() || graph->input_ids_.size() > 2 || graph->output_ids_.size() != 1) {
+        return binding_result::failure(host_error(error_stage::io_binding, "binding.create", "Graph is not finalized with supported I/O"));
     }
     auto binding = std::unique_ptr<execution_binding>(new execution_binding());
     binding->graph_ = std::move(graph);

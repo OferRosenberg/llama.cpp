@@ -614,10 +614,8 @@ ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-# M0 has no registered backend. Tests must be able to link this target in DL builds.
-if (GGML_QAIRT)
-    add_subdirectory(ggml-qairt)
-elseif (GGML_QAIRT_TESTS OR GGML_QAIRT_HW_TESTS)
+ggml_add_backend(QAIRT)
+if (NOT GGML_QAIRT AND (GGML_QAIRT_TESTS OR GGML_QAIRT_HW_TESTS))
     message(FATAL_ERROR "QAIRT tests require GGML_QAIRT=ON")
 endif()
 

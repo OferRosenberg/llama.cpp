@@ -53,6 +53,15 @@ result<runtime_config> config_parser::from_environment() {
     }
     const wchar_t * directory = _wgetenv(L"GGML_QAIRT_LIBRARY_DIR");
     if (directory) { config.library_directory = directory; }
+    for (const auto & option : { std::make_pair("GGML_QAIRT_PROFILE", &config.enable_profile),
+                                std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics) }) {
+        const char * value = std::getenv(option.first);
+        if (!value) { continue; }
+        if (std::string_view(value) != "0" && std::string_view(value) != "1") {
+            return result<runtime_config>::failure(host_error(error_stage::configuration, option.first, "Expected 0 or 1"));
+        }
+        *option.second = std::string_view(value) == "1";
+    }
     auto checked = validate(config);
     if (!checked.ok()) { return result<runtime_config>::failure(checked.error()); }
     return result<runtime_config>::success(std::move(config));
@@ -85,16 +94,18 @@ target_descriptor target_catalog::describe(target_kind target) {
 result<std::unique_ptr<target_policy>> target_catalog::create_policy(target_kind target) {
     if (target != target_kind::htp) {
         return result<std::unique_ptr<target_policy>>::failure(host_error(
-            error_stage::configuration, "create_policy", "Target adapter not enabled in M0", target));
+            error_stage::configuration, "create_policy", "Target adapter not enabled", target));
     }
     return result<std::unique_ptr<target_policy>>::success(std::make_unique<htp_target_policy>());
 }
 
 const target_descriptor & htp_target_policy::descriptor() const noexcept { return descriptor_; }
 status htp_target_policy::admit_matmul(const matmul_spec & spec) const {
-    if (spec.m != 2 || spec.k != 4 || spec.n != 3 || spec.transpose_input0 || !spec.transpose_input1 ||
+    if (!spec.m || !spec.k || !spec.n || uint64_t(spec.m) * spec.k > UINT32_MAX / 2 ||
+        uint64_t(spec.n) * spec.k > UINT32_MAX / 2 || uint64_t(spec.m) * spec.n > UINT32_MAX / 2 ||
+        spec.transpose_input0 || !spec.transpose_input1 ||
         spec.dtype != QNN_DATATYPE_FLOAT_16) {
-        return status::failure(host_error(error_stage::op_validation, "admit_matmul", "M0 supports the fixed FP16 MatMul fixture only"));
+        return status::failure(host_error(error_stage::op_validation, "admit_matmul", "Unsupported FP16 MatMul dimensions or transpose policy"));
     }
     return status::success();
 }

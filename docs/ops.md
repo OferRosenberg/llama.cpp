@@ -2,6 +2,8 @@
 
 List of GGML operations and backend support status.
 
+QAIRT M1 has a bounded float subset. See [QAIRT setup and support](backend/QAIRT.md) and [representative support probes](ops/QAIRT.csv). The QAIRT snapshot retains one actual case per operation/support result; it does not establish full operator coverage or performance.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

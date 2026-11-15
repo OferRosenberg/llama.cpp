@@ -66,4 +66,4 @@ Validated against local llama.cpp commit `d90cfd4a9`, QAIRT SDK `2.52.0.261104`,
 
 The provider reported HTP architecture 73 and an unspecified SoC. SDK diagnostics reported failure of its traditional transport and some unsupported driver options/events, then selected the HTP user-driver path. Required MatMul and basic profile checks still passed. These results establish the tiny M0 fixture only; transformer graphs, GGUF quantization, KV state and complete profiling compatibility require later milestones.
 
-The complete build emitted existing compiler/build warnings and built without embedded Web UI assets. UI downloads were disabled for subsequent builds. No QAIRT source compilation error remains. Changes are uncommitted on `Add-ggml-qairt-backedn`; no backend has been registered or offered to the GGML scheduler yet.
+The complete build emitted existing compiler/build warnings and built without embedded Web UI assets. UI downloads were disabled for subsequent builds. No QAIRT source compilation error remains. M0 is recorded in local commit `05e54784b`. M1 adds the registered backend; see [current setup and support](../../../docs/backend/QAIRT.md).

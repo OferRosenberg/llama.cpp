@@ -371,6 +371,18 @@ if (GGML_QAIRT AND GGML_QAIRT_TESTS)
     target_include_directories(test-qairt-smoke PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-qairt ${QAIRT_SDK_ROOT}/include/QNN)
     llama_test(test-qairt-smoke NAME qairt-host ARGS --host-tests)
+    llama_build(test-qairt.cpp LINK ggml ggml-qairt-core ggml-base Threads::Threads)
+    target_include_directories(test-qairt PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-qairt)
+    llama_test(test-qairt NAME qairt-m1-host ARGS --host)
+    llama_test(test-qairt NAME qairt-m1-gpu-disabled ARGS --unavailable)
+    llama_test(test-qairt NAME qairt-m1-cpu-disabled ARGS --unavailable)
+    set_tests_properties(qairt-m1-gpu-disabled PROPERTIES
+        ENVIRONMENT "GGML_QAIRT_DEVICE=GPU;GGML_QAIRT_LIBRARY_DIR=C:/QNN-unused")
+    set_tests_properties(qairt-m1-cpu-disabled PROPERTIES
+        ENVIRONMENT "GGML_QAIRT_DEVICE=CPU;GGML_QAIRT_LIBRARY_DIR=C:/QNN-unused")
+    if (GGML_QAIRT_HW_TESTS)
+        llama_test(test-qairt NAME qairt-m1-htp LABEL hardware)
+    endif()
     llama_test(test-qairt-smoke NAME qairt-capture-success ARGS --capture-success)
     llama_test(test-qairt-smoke NAME qairt-capture-failure ARGS --capture-failure)
     if (GGML_QAIRT_HW_TESTS)
