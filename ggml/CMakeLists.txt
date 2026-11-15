@@ -261,6 +261,9 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_QAIRT                           "ggml: build the QAIRT M0 runtime core"           OFF)
+option(GGML_QAIRT_TESTS                     "ggml: build QAIRT host and smoke tests"          OFF)
+option(GGML_QAIRT_HW_TESTS                  "ggml: enable QAIRT HTP hardware tests"           OFF)
 option(GGML_ET                              "ggml: use ET backend"                            OFF)
 option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 

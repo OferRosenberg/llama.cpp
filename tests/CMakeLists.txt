@@ -366,6 +366,18 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+if (GGML_QAIRT AND GGML_QAIRT_TESTS)
+    llama_build(test-qairt-smoke.cpp LINK ggml-qairt-core ggml-base Threads::Threads)
+    target_include_directories(test-qairt-smoke PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-qairt ${QAIRT_SDK_ROOT}/include/QNN)
+    llama_test(test-qairt-smoke NAME qairt-host ARGS --host-tests)
+    llama_test(test-qairt-smoke NAME qairt-capture-success ARGS --capture-success)
+    llama_test(test-qairt-smoke NAME qairt-capture-failure ARGS --capture-failure)
+    if (GGML_QAIRT_HW_TESTS)
+        llama_test(test-qairt-smoke NAME qairt-htp LABEL hardware ARGS --hardware-test)
+    endif()
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)
