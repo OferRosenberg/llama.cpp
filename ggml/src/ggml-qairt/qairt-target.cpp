@@ -54,7 +54,11 @@ result<runtime_config> config_parser::from_environment() {
     const wchar_t * directory = _wgetenv(L"GGML_QAIRT_LIBRARY_DIR");
     if (directory) { config.library_directory = directory; }
     for (const auto & option : { std::make_pair("GGML_QAIRT_PROFILE", &config.enable_profile),
-                                std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics) }) {
+                                std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics),
+                                std::make_pair("GGML_QAIRT_DIRECT_FP16", &config.direct_fp16),
+                                std::make_pair("GGML_QAIRT_EXPERIMENTAL_SOFTMAX", &config.experimental_softmax),
+                                std::make_pair("GGML_QAIRT_EXPERIMENTAL_ADD", &config.experimental_add),
+                                std::make_pair("GGML_QAIRT_EXPERIMENTAL_ROPE", &config.experimental_rope), std::make_pair("GGML_QAIRT_EXPERIMENTAL_ATTENTION", &config.experimental_attention) }) {
         const char * value = std::getenv(option.first);
         if (!value) { continue; }
         if (std::string_view(value) != "0" && std::string_view(value) != "1") {

@@ -12,7 +12,13 @@ struct runtime_config {
     target_kind target = target_kind::htp;
     std::filesystem::path library_directory;
     bool enable_profile = false;
+    bool experimental_softmax = false;
+    bool experimental_add = false;
+    bool experimental_rope = false;
+    bool experimental_attention = false;
     bool verbose_diagnostics = false;
+    // Default QNN numerical boundaries use FP16 without CPU dot-product preparation.
+    bool direct_fp16 = true;
 };
 
 struct target_descriptor {

@@ -2,7 +2,7 @@
 
 List of GGML operations and backend support status.
 
-QAIRT M1 has a bounded float subset. See [QAIRT setup and support](backend/QAIRT.md) and [representative support probes](ops/QAIRT.csv). The QAIRT snapshot retains one actual case per operation/support result; it does not establish full operator coverage or performance.
+QAIRT M2 has a bounded FP16 projection/MUL/RMS_NORM/NORM/SiLU subset, Q4_K/Q6_K and BF16 weight conversion, plus experimental causal grouped attention and F16 KV writeback. The attention profile uses native QNN GroupQueryAttention when available, with a QNN decomposition fallback on the installed driver. Explicit attention accumulation requests remain unsupported; default support-table settings keep the experimental profiles disabled. See [QAIRT setup and support](backend/QAIRT.md) and [representative support probes](ops/QAIRT.csv). Softmax, residual ADD and Genie-style cached ROPE are experimental and disabled by default pending broader model qualification. The QAIRT snapshot retains one actual case per operation/support result; it does not establish full operator coverage or performance.
 
 ## How to add a backend to this table:
 

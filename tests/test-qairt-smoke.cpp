@@ -42,6 +42,9 @@ static void test_configuration() {
     }
     runtime_config config;
     CHECK(config.target == target_kind::htp);
+    CHECK(!config.experimental_softmax);
+    CHECK(!config.experimental_add);
+    CHECK(!config.experimental_rope);
     CHECK(!config_parser::validate(config).ok());
     config.library_directory = "relative";
     CHECK(!config_parser::validate(config).ok());
@@ -65,6 +68,29 @@ static void test_configuration() {
     }
 }
 
+
+static void test_direct_fp16_configuration() {
+    const auto saved = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value ? std::string(value) : std::string();
+    };
+    const auto previous_target = saved("GGML_QAIRT_DEVICE");
+    const auto previous_option = saved("GGML_QAIRT_DIRECT_FP16");
+    const wchar_t * directory = _wgetenv(L"GGML_QAIRT_LIBRARY_DIR");
+    const std::wstring previous_directory = directory ? directory : L"";
+    CHECK(_putenv_s("GGML_QAIRT_DEVICE", "HTP") == 0);
+    CHECK(_wputenv_s(L"GGML_QAIRT_LIBRARY_DIR", L"C:\\QNN") == 0);
+    for (const char * value : {"", "0", "1", "2", "true"}) {
+        CHECK(_putenv_s("GGML_QAIRT_DIRECT_FP16", value) == 0);
+        auto parsed = config_parser::from_environment();
+        const bool valid = !*value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0;
+        CHECK(parsed.ok() == valid);
+        if (parsed.ok()) { CHECK(parsed.value().direct_fp16 == (!*value || std::strcmp(value, "1") == 0)); }
+    }
+    CHECK(_putenv_s("GGML_QAIRT_DEVICE", previous_target.c_str()) == 0);
+    CHECK(_putenv_s("GGML_QAIRT_DIRECT_FP16", previous_option.c_str()) == 0);
+    CHECK(_wputenv_s(L"GGML_QAIRT_LIBRARY_DIR", previous_directory.c_str()) == 0);
+}
 static void test_providers() {
     CHECK(!qnn_api::from_providers(nullptr, 0).ok());
     QnnInterface_t provider = QNN_INTERFACE_INIT;
@@ -247,6 +273,8 @@ static void test_tensor_sizes() {
     spec.dimensions = {0, 4};
     CHECK(!tensor_record::checked_bytes(spec).ok());
     spec.dimensions = {2, 4}; spec.dtype = QNN_DATATYPE_FLOAT_32;
+    CHECK(!tensor_record::checked_bytes(spec).ok());
+    spec.dtype = QNN_DATATYPE_FLOAT_64;
     CHECK(!tensor_record::checked_bytes(spec).ok());
     spec.dtype = QNN_DATATYPE_FLOAT_16; spec.role = QNN_TENSOR_TYPE_APP_READWRITE;
     CHECK(!tensor_record::checked_bytes(spec).ok());
@@ -474,6 +502,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--host-tests") {
             test_configuration();
+            test_direct_fp16_configuration();
             test_providers();
             test_runtime();
             test_tensor_sizes();

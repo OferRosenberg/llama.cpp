@@ -145,6 +145,7 @@ struct registry_context {
     std::weak_ptr<runtime_owner> runtime;
     std::shared_ptr<const runtime_config> config;
     std::mutex mutex;
+    ggml_backend_qairt_stats totals {};
     bool available = false;
     std::string description;
     ggml_backend_reg reg {};
@@ -161,23 +162,27 @@ void device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
 }
 ggml_backend_buffer_type_t device_buft(ggml_backend_dev_t dev) { return &static_cast<registry_context *>(dev->context)->buft; }
 bool device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return buft && (buft->iface.get_name == buffer_type_name || ggml_backend_buft_is_host(buft));
+    return buft && buft->iface.get_name == buffer_type_name;
 }
 bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * t) {
     try {
         if (!primitive_supported(t)) { return false; }
-        const ggml_tensor * operands[] = {t, t->src[0], t->src[1]};
+        if (t->op == GGML_OP_SOFT_MAX && !static_cast<registry_context *>(dev->context)->config->experimental_softmax) { return false; }
+        if (t->op == GGML_OP_ADD && !static_cast<registry_context *>(dev->context)->config->experimental_add) { return false; }
+        if (t->op == GGML_OP_ROPE && !static_cast<registry_context *>(dev->context)->config->experimental_rope) { return false; }
+        if ((t->op == GGML_OP_FLASH_ATTN_EXT || t->op == GGML_OP_SET_ROWS) && !static_cast<registry_context *>(dev->context)->config->experimental_attention) { return false; }
+        const ggml_tensor * operands[] = {t, t->src[0], t->src[1], (t->op == GGML_OP_ROPE || t->op == GGML_OP_FLASH_ATTN_EXT || t->op == GGML_OP_SET_ROWS) ? t->src[2] : nullptr, t->op == GGML_OP_FLASH_ATTN_EXT ? t->src[3] : nullptr};
         for (const auto * s : operands) {
             if (!s) { continue; }
             auto b = tensor_buffer(s);
-            if (b && !device_supports_buft(dev, b->buft)) { return false; }
+            if (b && !device_supports_buft(dev, b->buft) && !ggml_backend_buft_is_host(b->buft)) { return false; }
         }
         return true;
     } catch (...) { return false; }
 }
 bool device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * t) {
     // Only numerical primitives request offload; layout helpers follow their partition.
-    return t && (t->op == GGML_OP_MUL_MAT || elementwise_type(t->op)) && device_supports_op(dev, t);
+    return t && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_FLASH_ATTN_EXT || t->op == GGML_OP_SET_ROWS || elementwise_type(t->op)) && device_supports_op(dev, t);
 }
 const char * backend_name(ggml_backend_t) { return "QAIRT"; }
 void backend_free(ggml_backend_t backend) {
@@ -185,7 +190,18 @@ void backend_free(ggml_backend_t backend) {
     delete backend;
 }
 enum ggml_status backend_compute(ggml_backend_t backend, ggml_cgraph * graph) {
-    try { return static_cast<backend_context *>(backend->context)->compute(graph); }
+    auto * context = static_cast<backend_context *>(backend->context);
+    const auto before = context->stats();
+    try {
+        const auto result = context->compute(graph);
+        const auto after = context->stats();
+        auto * state = static_cast<registry_context *>(backend->device->context);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->totals.preparations += after.preparations - before.preparations;
+        state->totals.cache_hits += after.cache_hits - before.cache_hits;
+        state->totals.executions += after.executions - before.executions;
+        return result;
+    }
     catch (const std::exception & e) { GGML_LOG_ERROR("qairt: graph_compute: %s\n", e.what()); }
     catch (...) { GGML_LOG_ERROR("qairt: graph_compute: unknown exception\n"); }
     static_cast<backend_context *>(backend->context)->invalidate();
@@ -222,7 +238,15 @@ bool get_stats(ggml_backend_t backend, ggml_backend_qairt_stats * stats) {
     *stats = static_cast<backend_context *>(backend->context)->stats();
     return true;
 }
+bool get_device_stats(ggml_backend_dev_t device, ggml_backend_qairt_stats * stats) {
+    if (!device || !stats || device->iface.get_name != device_name) { return false; }
+    auto * state = static_cast<registry_context *>(device->context);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    *stats = state->totals;
+    return true;
+}
 void * registry_proc(ggml_backend_reg_t, const char * name) {
+    if (name && std::strcmp(name, "ggml_backend_qairt_get_device_stats") == 0) { return reinterpret_cast<void *>(get_device_stats); }
     return name && std::strcmp(name, "ggml_backend_qairt_get_stats") == 0 ? reinterpret_cast<void *>(get_stats) : nullptr;
 }
 }
@@ -231,7 +255,7 @@ namespace ggml::qairt {
 void buffer_context::touch() noexcept { generation = next_generation.fetch_add(1); }
 bool qairt_buffer(ggml_backend_buffer_t b) noexcept { return b && b->buft->iface.get_name == buffer_type_name; }
 bool readable_tensor(const ggml_tensor * t) noexcept {
-    if (!float_layout(t) || !t->data) { return false; }
+    if ((!weight_layout(t) && !row_layout(t) && !index_layout(t) && !(t && metadata_op(t->op) && metadata_layout(t))) || !t->data) { return false; }
     auto b = tensor_buffer(t);
     if (!b || !ggml_backend_buft_is_host(b->buft)) { return false; }
     const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(b));
@@ -253,7 +277,7 @@ extern "C" ggml_backend_reg_t ggml_backend_qairt_reg(void) {
             if (!runtime.ok()) { GGML_LOG_ERROR("qairt: %s: %s\n", runtime.error().operation.c_str(), runtime.error().message.c_str()); return; }
             state.config = config.value();
             auto owner = std::move(runtime).value();
-            state.description = owner->policy().descriptor().display_name + " (FP16 primitives, M1)";
+            state.description = owner->policy().descriptor().display_name + " (FP16 dense projections, M2)";
             if (owner->platform().htp_architecture) { state.description += " arch " + std::to_string(*owner->platform().htp_architecture); }
             state.device.reg = &state.reg; state.device.context = &state;
             auto & d = state.device.iface;
