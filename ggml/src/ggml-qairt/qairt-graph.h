@@ -29,6 +29,7 @@ private:
 
 enum class graph_state { building, finalized, failed, closed };
 struct scalar_parameter { std::string name; Qnn_Scalar_t value; };
+struct tensor_parameter { std::string name; std::vector<uint32_t> dimensions; std::vector<uint32_t> values; Qnn_DataType_t dtype = QNN_DATATYPE_UINT_32; };
 struct op_spec {
     std::string name;
     std::string package_name;
@@ -36,7 +37,16 @@ struct op_spec {
     std::vector<tensor_id> inputs;
     std::vector<tensor_id> outputs;
     std::vector<scalar_parameter> parameters;
+    std::vector<tensor_parameter> tensor_parameters;
+    static op_spec normalization(tensor_id a, tensor_id gamma, tensor_id beta, tensor_id y, bool rms, float epsilon, uint32_t axis);
+    static op_spec softmax(tensor_id a, tensor_id y, float beta, uint32_t axis_value);
     static op_spec matmul(tensor_id a, tensor_id w, tensor_id y);
+    static op_spec transpose(tensor_id input, tensor_id output, std::vector<uint32_t> permutation);
+    static op_spec gather_rows(tensor_id data, tensor_id indices, tensor_id output);
+    static op_spec scatter_rows(tensor_id cache, tensor_id indices, tensor_id updates, tensor_id output);
+    static op_spec sigmoid(tensor_id x, tensor_id y);
+    static op_spec group_query_attention(std::vector<tensor_id> inputs, std::vector<tensor_id> outputs, uint32_t heads, uint32_t kv_heads, float scale);
+    static op_spec rotary_embedding(tensor_id x, tensor_id cosine, tensor_id sine, tensor_id y, uint32_t dimensions, bool interleaved);
 };
 class execution_binding;
 
@@ -65,6 +75,7 @@ private:
     std::vector<tensor_id> output_ids_;
     mutable uint32_t active_bindings_ = 0;
     bool node_added_ = false;
+    std::vector<tensor_id> produced_ids_;
 };
 
 class op_packet final {
@@ -74,6 +85,11 @@ public:
     op_packet & operator=(const op_packet &) = delete;
     Qnn_OpConfig_t descriptor() noexcept;
 private:
+    friend class graph_owner;
+    status register_parameters(graph_owner & graph);
+    static result<std::unique_ptr<op_packet>> create_gather(const graph_owner & graph, const op_spec & spec);
+    static result<std::unique_ptr<op_packet>> create_scatter(const graph_owner & graph, const op_spec & spec);
+    static result<std::unique_ptr<op_packet>> create_attention(const graph_owner & graph, const op_spec & spec);
     op_packet() = default;
     op_spec spec_;
     std::vector<Qnn_Param_t> parameters_;

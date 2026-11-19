@@ -2,7 +2,7 @@
 
 List of GGML operations and backend support status.
 
-QAIRT M1 has a bounded float subset. See [QAIRT setup and support](backend/QAIRT.md) and [representative support probes](ops/QAIRT.csv). The QAIRT snapshot retains one actual case per operation/support result; it does not establish full operator coverage or performance.
+QAIRT M2 uses FP16 QNN weights, activations and outputs, with expanded normalization, RoPE, masked Softmax, grouped attention, residual/SwiGLU, Gather and KV ScatterNd recipes. Original CPU model local/intermediate accuracy remains gated. See [QAIRT setup and support](backend/QAIRT.md) and [representative support probes](ops/QAIRT.csv). The November 19, 2026 snapshot retains 135 actual operation/support outcomes from 23,594 probes; it does not establish full operator coverage, numerical accuracy or performance.
 
 ## How to add a backend to this table:
 

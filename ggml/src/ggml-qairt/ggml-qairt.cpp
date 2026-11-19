@@ -161,28 +161,31 @@ void device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
 }
 ggml_backend_buffer_type_t device_buft(ggml_backend_dev_t dev) { return &static_cast<registry_context *>(dev->context)->buft; }
 bool device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return buft && (buft->iface.get_name == buffer_type_name || ggml_backend_buft_is_host(buft));
+    return buft && ggml_backend_buft_is_host(buft);
 }
-bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * t) {
+bool device_supports_op(ggml_backend_dev_t, const ggml_tensor * t) {
     try {
-        if (!primitive_supported(t)) { return false; }
-        const ggml_tensor * operands[] = {t, t->src[0], t->src[1]};
-        for (const auto * s : operands) {
-            if (!s) { continue; }
-            auto b = tensor_buffer(s);
-            if (b && !device_supports_buft(dev, b->buft)) { return false; }
-        }
-        return true;
+        return primitive_supported(t);
     } catch (...) { return false; }
 }
 bool device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * t) {
     // Only numerical primitives request offload; layout helpers follow their partition.
-    return t && (t->op == GGML_OP_MUL_MAT || elementwise_type(t->op)) && device_supports_op(dev, t);
+    return t && !metadata_op(t->op) && device_supports_op(dev, t);
 }
 const char * backend_name(ggml_backend_t) { return "QAIRT"; }
 void backend_free(ggml_backend_t backend) {
     delete static_cast<backend_context *>(backend->context);
     delete backend;
+}
+void backend_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    const int count = ggml_graph_n_nodes(graph);
+    if (!params || !params->add_alloc_dep || count == 0) { return; }
+    auto * last = ggml_graph_node(graph, count-1);
+    // QNN writes the readable GGML outputs together at partition completion.
+    for (int i = 0; i + 1 < count; ++i) {
+        auto * node = ggml_graph_node(graph, i);
+        if (!metadata_op(node->op)) { params->add_alloc_dep(params->user_data,node,last); }
+    }
 }
 enum ggml_status backend_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     try { return static_cast<backend_context *>(backend->context)->compute(graph); }
@@ -206,7 +209,7 @@ ggml_backend_t device_init(ggml_backend_dev_t dev, const char * params) {
         auto c = std::make_unique<backend_context>(std::move(runtime));
         static ggml_guid guid = {0x71,0xa1,0x52,0x01,0x13,0x08,0x41,0x91,0xb1,0x32,0x67,0x85,0x22,0x10,0xe4,0x90};
         ggml_backend_i iface {};
-        iface.get_name = backend_name; iface.free = backend_free; iface.graph_compute = backend_compute;
+        iface.get_name = backend_name; iface.free = backend_free; iface.graph_compute = backend_compute; iface.graph_optimize = backend_optimize;
         auto * backend = new ggml_backend { &guid, iface, dev, c.get() };
         c.release();
         return backend;
@@ -231,7 +234,7 @@ namespace ggml::qairt {
 void buffer_context::touch() noexcept { generation = next_generation.fetch_add(1); }
 bool qairt_buffer(ggml_backend_buffer_t b) noexcept { return b && b->buft->iface.get_name == buffer_type_name; }
 bool readable_tensor(const ggml_tensor * t) noexcept {
-    if (!float_layout(t) || !t->data) { return false; }
+    if ((!metadata_layout(t) && !weight_layout(t) && !index_layout(t)) || !t->data) { return false; }
     auto b = tensor_buffer(t);
     if (!b || !ggml_backend_buft_is_host(b->buft)) { return false; }
     const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(b));
@@ -253,7 +256,7 @@ extern "C" ggml_backend_reg_t ggml_backend_qairt_reg(void) {
             if (!runtime.ok()) { GGML_LOG_ERROR("qairt: %s: %s\n", runtime.error().operation.c_str(), runtime.error().message.c_str()); return; }
             state.config = config.value();
             auto owner = std::move(runtime).value();
-            state.description = owner->policy().descriptor().display_name + " (FP16 primitives, M1)";
+            state.description = owner->policy().descriptor().display_name + " (FP16 weights and activations)";
             if (owner->platform().htp_architecture) { state.description += " arch " + std::to_string(*owner->platform().htp_architecture); }
             state.device.reg = &state.reg; state.device.context = &state;
             auto & d = state.device.iface;

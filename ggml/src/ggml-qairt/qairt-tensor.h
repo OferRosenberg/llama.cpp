@@ -28,6 +28,7 @@ template<> struct qnn_type_traits<fp16_bits> {
 };
 
 struct tensor_id { uint32_t value = 0; };
+inline constexpr tensor_id null_tensor_id {UINT32_MAX};
 struct tensor_spec {
     std::string name;
     Qnn_TensorType_t role;

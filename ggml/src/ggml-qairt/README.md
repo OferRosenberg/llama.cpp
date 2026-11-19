@@ -1,4 +1,15 @@
-# QAIRT M0 runtime core
+# QAIRT backend
+
+Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. Numerical QNN tensors are FP16. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
+
+
+The registered ggml-qairt backend now supports expanded FP16 HTP recipes for projections, normalization/scales, residuals, SiLU/SwiGLU, RoPE, masked Softmax, grouped attention, Gather and KV ScatterNd. Numerical QNN tensors use FP16; index/control tensors use SDK-required integer types. GPU/CPU target policies remain architecturally present but disabled.
+
+See [current build, support, ownership and accuracy status](../../../docs/backend/QAIRT.md). The M2 Full FP16 checkpoint builds on Windows ARM64 and passes all 14 QAIRT CTests. All 28 Qwen3 blocks are covered by the per-block hybrid fixture, with identical 20-token greedy output against the FP16-emulated CPU reference. Numerical accuracy exceptions, CPU fallbacks and fixture limits remain documented.
+
+## Historical M0 runtime-core record
+
+The following sections preserve the initial M0 implementation and its validation. Their future-tense M1 references describe that earlier checkpoint.
 
 This directory implements the first QAIRT integration milestone: constructing, finalizing and executing a direct FP16 MatMul graph through the released QNN API. It is an internal static library, not a registered GGML backend. GGUF loading, GGML buffers, scheduler offload, model lowering and KV cache integration start in M1.
 

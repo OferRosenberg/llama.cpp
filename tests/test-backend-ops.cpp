@@ -1273,6 +1273,10 @@ struct test_case {
         if (contains_f16 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
             return std::max(max_nmse_err(), 1e-6);
         }
+        // QAIRT uses FP16 numerical tensors, including F32 GGML boundaries.
+        if (strcmp(ggml_backend_reg_name(reg), "QAIRT") == 0) {
+            return std::max(max_nmse_err(), 1e-5);
+        }
         return max_nmse_err();
     }
 

@@ -43,6 +43,22 @@ static void expect(ggml_tensor * t, const std::vector<float> & reference, float 
         CHECK(std::isfinite(actual[i]) && std::fabs(actual[i] - reference[i]) <= tolerance * std::max(1.0f, std::fabs(reference[i])));
     }
 }
+
+static void m2_host_tests() {
+    ggml_backend_load_all();
+    auto * c = context();
+    auto * weights = ggml_new_tensor_2d(c, GGML_TYPE_Q4_0, 2048, 1024);
+    auto * input = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 13);
+    auto * output = ggml_mul_mat(c, weights, input);
+    CHECK(primitive_supported(output));
+    CHECK(ggml_prec_set_acc(output, GGML_PREC_F32));
+    CHECK(!primitive_supported(output));
+    CHECK(ggml_prec_set_acc(output, GGML_PREC_DEFAULT));
+    CHECK(ggml_prec_set_src(output, GGML_PREC_F32, 1));
+    CHECK(!primitive_supported(output));
+    ggml_free(c);
+}
+
 static void host_tests() {
     auto * c = context();
     auto * w = ggml_new_tensor_2d(c, GGML_TYPE_F16, 4, 3);
@@ -50,9 +66,9 @@ static void host_tests() {
     auto * y = ggml_mul_mat(c, w, a);
     CHECK(primitive_supported(y));
     ggml_mul_mat_set_prec(y, GGML_PREC_F32);
-    CHECK(!primitive_supported(y));
+    CHECK(primitive_supported(y));
     ggml_mul_mat_set_prec(y, GGML_PREC_DEFAULT);
-    CHECK(!primitive_supported(ggml_add(c, a, ggml_new_tensor_2d(c, GGML_TYPE_F32, 4, 1))));
+    CHECK(primitive_supported(ggml_add(c, a, ggml_new_tensor_2d(c, GGML_TYPE_F32, 4, 1))));
     auto * half = ggml_new_tensor_2d(c, GGML_TYPE_F16, 4, 2);
     CHECK(primitive_supported(ggml_add(c, half, ggml_new_tensor_2d(c, GGML_TYPE_F16, 4, 1))));
     CHECK(primitive_supported(ggml_cont(c, ggml_transpose(c, a))));
@@ -124,9 +140,9 @@ static void matmul_tests(ggml_backend_t backend, enum ggml_type weight_type, enu
         }
         if (stats_fn) {
             CHECK(stats_fn(backend, &after));
-            CHECK(after.preparations - before.preparations <= 2);
-            CHECK(after.cache_hits - before.cache_hits >= 4);
-            CHECK(after.executions - before.executions == 6);
+            CHECK(after.preparations - before.preparations == 1);
+            CHECK(after.cache_hits - before.cache_hits == 2);
+            CHECK(after.executions - before.executions == 3);
         }
         auto twice = weights; for (auto & value : twice) { value *= 2; }
         upload(w, twice);
@@ -223,7 +239,8 @@ static void placement_test(ggml_backend_t qairt) {
     ggml_free(c);
 }
 int main(int argc, char ** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--host") == 0) { host_tests(); }
+    if (argc == 2 && std::strcmp(argv[1], "--m2-host") == 0) { m2_host_tests(); }
+    else if (argc == 2 && std::strcmp(argv[1], "--host") == 0) { host_tests(); }
     else {
         ggml_backend_load_all();
         auto dev = ggml_backend_dev_by_name("QAIRT0");
