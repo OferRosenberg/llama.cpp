@@ -12,7 +12,7 @@ namespace ggml::qairt {
 namespace {
 constexpr size_t staging_limit = 256 * 1024 * 1024;
 constexpr size_t cache_limit = 512;
-constexpr uint64_t static_cache_limit = uint64_t(1) * 1024 * 1024 * 1024;
+constexpr uint64_t static_cache_limit = uint64_t(4) * 1024 * 1024 * 1024;
 
 qairt_error conversion_error(const char * text) { return host_error(error_stage::numerical_check, "float preparation", text); }
 

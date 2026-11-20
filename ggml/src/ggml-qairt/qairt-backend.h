@@ -2,17 +2,28 @@
 
 #include "qairt-graph.h"
 #include "qairt-lowering.h"
+#include "qairt-weights.h"
 #include "ggml-qairt.h"
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace ggml::qairt {
 
+struct buffer_weight {
+    size_t bytes = 0;
+    w4_weight_upload upload;
+};
 struct buffer_context {
     void * storage = nullptr;
     size_t size = 0;
     uint64_t identity = 0;
     uint64_t generation = 0;
+    bool w4fp16 = false;
+    bool diagnostics = false;
+    mutable std::mutex weights_mutex;
+    std::unordered_map<size_t,buffer_weight> weights;
     void touch() noexcept;
 };
 
@@ -52,6 +63,7 @@ struct partition_data {
     std::vector<partition_rope> ropes;
     std::vector<partition_span> spans;
     size_t qnn_nodes = 0;
+    size_t w4_matmuls = 0;
 };
 struct prepared_run {
     std::vector<uint64_t> key;

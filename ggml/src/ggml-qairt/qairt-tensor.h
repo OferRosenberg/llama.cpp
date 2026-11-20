@@ -2,6 +2,7 @@
 
 #include "qairt-status.h"
 
+#include <memory>
 #include <vector>
 
 namespace ggml::qairt {
@@ -29,11 +30,17 @@ template<> struct qnn_type_traits<fp16_bits> {
 
 struct tensor_id { uint32_t value = 0; };
 inline constexpr tensor_id null_tensor_id {UINT32_MAX};
+struct block_quantization {
+    std::vector<uint32_t> block_size;
+    std::vector<Qnn_FloatScaleOffset_t> scales;
+};
+
 struct tensor_spec {
     std::string name;
     Qnn_TensorType_t role;
     Qnn_DataType_t dtype;
     std::vector<uint32_t> dimensions;
+    std::shared_ptr<const block_quantization> quantization;
 };
 
 class graph_owner;
@@ -51,9 +58,17 @@ public:
     bool dimensions_unchanged() const noexcept { return abi_dimensions_ == spec_.dimensions; }
 private:
     friend class graph_owner;
-    explicit tensor_record(tensor_spec spec) : spec_(std::move(spec)), abi_dimensions_(spec_.dimensions) {}
+    explicit tensor_record(tensor_spec spec) : spec_(std::move(spec)), abi_dimensions_(spec_.dimensions) {
+        // SDK registration mutates offsets; each graph needs private ABI metadata.
+        if (spec_.quantization) {
+            abi_blocks_ = spec_.quantization->block_size;
+            abi_scales_ = spec_.quantization->scales;
+        }
+    }
     tensor_spec spec_;
     mutable std::vector<uint32_t> abi_dimensions_;
+    mutable std::vector<uint32_t> abi_blocks_;
+    mutable std::vector<Qnn_FloatScaleOffset_t> abi_scales_;
     tensor_id id_;
 };
 

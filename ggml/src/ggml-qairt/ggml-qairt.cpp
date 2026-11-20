@@ -14,6 +14,7 @@ using namespace ggml::qairt;
 
 namespace {
 std::atomic<uint64_t> next_generation {1};
+void configure_buffer(buffer_context & buffer, ggml_backend_buffer_type_t buft);
 const char * buffer_type_name(ggml_backend_buffer_type_t) { return "QAIRT"; }
 
 ggml_backend_buffer_t tensor_buffer(const ggml_tensor * t) {
@@ -52,6 +53,32 @@ bool checked_access(ggml_backend_buffer_t buffer, const ggml_tensor * t, size_t 
            offset <= bytes && size <= bytes - offset;
 }
 
+void weight_written(ggml_backend_buffer_t b, ggml_tensor * t, size_t offset, size_t size) {
+    auto * c = static_cast<buffer_context *>(b->context);
+    if (!c->w4fp16 || !size) { return; }
+    std::lock_guard<std::mutex> lock(c->weights_mutex);
+    const size_t begin = reinterpret_cast<uintptr_t>(t->data) - reinterpret_cast<uintptr_t>(c->storage);
+    const size_t first = begin + offset, last = first + size;
+    const bool eligible = ggml_backend_buffer_get_usage(b) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && q4_weight_layout(t);
+    for (auto it = c->weights.begin(); it != c->weights.end();) {
+        if (it->first < last && first < it->first + it->second.bytes && (it->first != begin || !eligible)) { it = c->weights.erase(it); }
+        else { ++it; }
+    }
+    if (!eligible) { return; }
+    try {
+        auto & entry = c->weights[begin]; entry.bytes = ggml_nbytes(t);
+        auto prepared = entry.upload.update({static_cast<const uint8_t *>(t->data),entry.bytes},size_t(t->ne[0]),size_t(t->ne[1]),offset,size);
+        const auto payload = entry.upload.get(size_t(t->ne[0]),size_t(t->ne[1]));
+        if (prepared.ok() && payload && c->diagnostics) {
+            GGML_LOG_INFO("qairt: W4FP16 initialized %s K=%zu N=%zu bytes=%zu repacks=%llu\n",ggml_get_name(t),payload->width,payload->rows,payload->bytes(),(unsigned long long)entry.upload.preparations());
+        }
+        if (!prepared.ok()) { GGML_LOG_ERROR("qairt: W4FP16 preparation for %s: %s; using FP16\n",ggml_get_name(t),prepared.error().message.c_str()); }
+    } catch (const std::exception & error) {
+        c->weights.erase(begin);
+        GGML_LOG_ERROR("qairt: W4FP16 preparation for %s: %s; using FP16\n",ggml_get_name(t),error.what());
+    }
+}
+
 void buffer_free(ggml_backend_buffer_t b) {
     auto * c = static_cast<buffer_context *>(b->context);
     _aligned_free(c->storage);
@@ -65,6 +92,7 @@ void buffer_set(ggml_backend_buffer_t b, ggml_tensor * t, const void * data, siz
     GGML_ASSERT(checked_access(b, t, offset, size) && (data || !size));
     if (size) { std::memmove(static_cast<uint8_t *>(t->data) + offset, data, size); }
     static_cast<buffer_context *>(b->context)->touch();
+    weight_written(b,t,offset,size);
 }
 void buffer_get(ggml_backend_buffer_t b, const ggml_tensor * t, void * data, size_t offset, size_t size) {
     GGML_ASSERT(checked_access(b, t, offset, size) && (data || !size));
@@ -74,6 +102,7 @@ void buffer_memset(ggml_backend_buffer_t b, ggml_tensor * t, uint8_t value, size
     GGML_ASSERT(checked_access(b, t, offset, size));
     if (size) { std::memset(static_cast<uint8_t *>(t->data) + offset, value, size); }
     static_cast<buffer_context *>(b->context)->touch();
+    weight_written(b,t,offset,size);
 }
 void buffer_set_n(ggml_backend_buffer_t b, ggml_tensor * const * ts, const void * const * data,
                   const size_t * offsets, const size_t * sizes, size_t count) {
@@ -89,7 +118,7 @@ bool can_copy(ggml_backend_buffer_t b, const ggml_tensor * src, ggml_tensor * ds
     size_t bytes = 0;
     if (!checked_span(src, bytes) || !src->data) { return false; }
     auto source = tensor_buffer(src);
-    return source && ggml_backend_buft_is_host(source->buft) && src->data &&
+    return source && (qairt_buffer(source) || ggml_backend_buft_is_host(source->buft)) && src->data &&
            ggml_are_same_layout(src, dst) && checked_access(b, dst, 0, bytes);
 }
 bool buffer_copy(ggml_backend_buffer_t b, const ggml_tensor * src, ggml_tensor * dst) {
@@ -114,6 +143,7 @@ bool buffer_copy_n(ggml_backend_buffer_t b, const ggml_tensor * const * src, ggm
 void buffer_clear(ggml_backend_buffer_t b, uint8_t value) {
     auto * c = static_cast<buffer_context *>(b->context);
     std::memset(c->storage, value, c->size);
+    { std::lock_guard<std::mutex> lock(c->weights_mutex); c->weights.clear(); }
     c->touch();
 }
 void buffer_reset(ggml_backend_buffer_t b) { static_cast<buffer_context *>(b->context)->touch(); }
@@ -123,6 +153,7 @@ ggml_backend_buffer_t buffer_alloc(ggml_backend_buffer_type_t buft, size_t size)
         if (size > std::numeric_limits<size_t>::max() - 63) { return nullptr; }
         auto c = std::make_unique<buffer_context>();
         c->size = size;
+        configure_buffer(*c,buft);
         c->identity = next_generation.fetch_add(1);
         c->touch();
         c->storage = _aligned_malloc(size ? (size + 63) & ~size_t(63) : 64, 64);
@@ -139,7 +170,7 @@ ggml_backend_buffer_t buffer_alloc(ggml_backend_buffer_type_t buft, size_t size)
     } catch (...) { return nullptr; }
 }
 size_t buffer_alignment(ggml_backend_buffer_type_t) { return 64; }
-bool buffer_host(ggml_backend_buffer_type_t) { return true; }
+bool buffer_host(ggml_backend_buffer_type_t buft);
 
 struct registry_context {
     std::weak_ptr<runtime_owner> runtime;
@@ -151,6 +182,13 @@ struct registry_context {
     ggml_backend_device device {};
     ggml_backend_buffer_type buft {};
 };
+void configure_buffer(buffer_context & buffer, ggml_backend_buffer_type_t buft) {
+    const auto * state = static_cast<const registry_context *>(buft->context);
+    if (state && state->config) {
+        buffer.w4fp16 = state->config->enable_w4fp16;
+        buffer.diagnostics = state->config->verbose_diagnostics;
+    }
+}
 const char * device_name(ggml_backend_dev_t) { return "QAIRT0"; }
 const char * device_description(ggml_backend_dev_t dev) { return static_cast<registry_context *>(dev->context)->description.c_str(); }
 void device_memory(ggml_backend_dev_t, size_t * available, size_t * total) { *available = 0; *total = 0; }
@@ -159,9 +197,14 @@ void device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     *props = {};
     props->name = device_name(dev); props->description = device_description(dev); props->type = device_type(dev);
 }
+// W4 sidecars require uploads through this backend, including non-mmap model loading.
+bool buffer_host(ggml_backend_buffer_type_t buft) {
+    const auto * state = static_cast<const registry_context *>(buft->context);
+    return !state || !state->config || !state->config->enable_w4fp16;
+}
 ggml_backend_buffer_type_t device_buft(ggml_backend_dev_t dev) { return &static_cast<registry_context *>(dev->context)->buft; }
 bool device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return buft && ggml_backend_buft_is_host(buft);
+    return buft && (buft->iface.get_name == buffer_type_name || ggml_backend_buft_is_host(buft));
 }
 bool device_supports_op(ggml_backend_dev_t, const ggml_tensor * t) {
     try {
@@ -236,7 +279,7 @@ bool qairt_buffer(ggml_backend_buffer_t b) noexcept { return b && b->buft->iface
 bool readable_tensor(const ggml_tensor * t) noexcept {
     if ((!metadata_layout(t) && !weight_layout(t) && !index_layout(t)) || !t->data) { return false; }
     auto b = tensor_buffer(t);
-    if (!b || !ggml_backend_buft_is_host(b->buft)) { return false; }
+    if (!b || (!qairt_buffer(b) && !ggml_backend_buft_is_host(b->buft))) { return false; }
     const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(b));
     const auto ptr = reinterpret_cast<uintptr_t>(t->data);
     const size_t size = ggml_backend_buffer_get_size(b);
@@ -256,7 +299,11 @@ extern "C" ggml_backend_reg_t ggml_backend_qairt_reg(void) {
             if (!runtime.ok()) { GGML_LOG_ERROR("qairt: %s: %s\n", runtime.error().operation.c_str(), runtime.error().message.c_str()); return; }
             state.config = config.value();
             auto owner = std::move(runtime).value();
-            state.description = owner->policy().descriptor().display_name + " (FP16 weights and activations)";
+            if (state.config->enable_w4fp16 && (!owner->platform().htp_architecture || *owner->platform().htp_architecture < 69)) {
+                GGML_LOG_ERROR("qairt: W4FP16 requires a known HTP architecture >= V69\n"); return;
+            }
+            state.description = owner->policy().descriptor().display_name +
+                (state.config->enable_w4fp16 ? " (W4FP16 projections, FP16 activations)" : " (FP16 weights and activations)");
             if (owner->platform().htp_architecture) { state.description += " arch " + std::to_string(*owner->platform().htp_architecture); }
             state.device.reg = &state.reg; state.device.context = &state;
             auto & d = state.device.iface;

@@ -40,6 +40,9 @@ status config_parser::validate(const runtime_config & config) {
     if (config.target != target_kind::htp && config.target != target_kind::gpu && config.target != target_kind::cpu) {
         return status::failure(host_error(error_stage::configuration, "target", "Invalid target", config.target));
     }
+    if (config.enable_w4fp16 && config.target != target_kind::htp) {
+        return status::failure(host_error(error_stage::configuration, "GGML_QAIRT_W4FP16", "W4FP16 requires HTP", config.target));
+    }
     return status::success();
 }
 
@@ -54,7 +57,8 @@ result<runtime_config> config_parser::from_environment() {
     const wchar_t * directory = _wgetenv(L"GGML_QAIRT_LIBRARY_DIR");
     if (directory) { config.library_directory = directory; }
     for (const auto & option : { std::make_pair("GGML_QAIRT_PROFILE", &config.enable_profile),
-                                std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics) }) {
+                                std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics),
+                                std::make_pair("GGML_QAIRT_W4FP16", &config.enable_w4fp16) }) {
         const char * value = std::getenv(option.first);
         if (!value) { continue; }
         if (std::string_view(value) != "0" && std::string_view(value) != "1") {

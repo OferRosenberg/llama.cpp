@@ -10,6 +10,11 @@ struct ggml_backend_qairt_stats {
     uint64_t preparations;
     uint64_t cache_hits;
     uint64_t executions;
+    uint64_t w4_preparations;
+    uint64_t w4_executions;
+    uint64_t preparation_time_us;
+    uint64_t finalization_time_us;
+    uint64_t finalization_failures;
 };
 
 typedef bool (*ggml_backend_qairt_get_stats_t)(ggml_backend_t backend, struct ggml_backend_qairt_stats * stats);

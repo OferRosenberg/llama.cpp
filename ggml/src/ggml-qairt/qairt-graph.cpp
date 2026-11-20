@@ -362,28 +362,32 @@ result<std::unique_ptr<op_packet>> op_packet::create(const graph_owner & graph, 
         return tensor && (tensor->spec().role == QNN_TENSOR_TYPE_APP_WRITE || tensor->spec().role == QNN_TENSOR_TYPE_STATIC ||
                           tensor->spec().role == QNN_TENSOR_TYPE_NATIVE || tensor->spec().role == QNN_TENSOR_TYPE_APP_READ);
     };
+    const bool block_weight = matmul && w && w->spec().dtype == QNN_DATATYPE_SFIXED_POINT_8 &&
+        w->spec().role == QNN_TENSOR_TYPE_STATIC && w->spec().quantization;
     if (!input_role(a) || (!unary && !input_role(w)) || !y ||
         (y->spec().role != QNN_TENSOR_TYPE_APP_READ && y->spec().role != QNN_TENSOR_TYPE_NATIVE) ||
-        a->spec().dtype != y->spec().dtype || (!unary && (a->spec().dtype != QNN_DATATYPE_FLOAT_16 || w->spec().dtype != a->spec().dtype))) {
+        a->spec().dtype != y->spec().dtype || (!unary && (a->spec().dtype != QNN_DATATYPE_FLOAT_16 || (w->spec().dtype != a->spec().dtype && !block_weight)))) {
         return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid primitive IDs, types or roles"));
     }
     const auto & ad = a->spec().dimensions;
     const auto & yd = y->spec().dimensions;
     if (ad.empty() || ad.size() > 4 || yd.size() != ad.size() ||
-        (matmul && (ad.size() != 2 || w->spec().dimensions.size() != 2)) ||
+        (matmul && (ad.size() != (block_weight ? 4 : 2) || w->spec().dimensions.size() != ad.size())) ||
         (elementwise && w->spec().dimensions.size() != ad.size())) {
         return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Unsupported numerical rank"));
     }
     if (matmul) {
         const auto & wd = w->spec().dimensions;
-        if (ad[1] != wd[1] || yd[0] != ad[0] || yd[1] != wd[0] ||
+        const size_t base = block_weight ? 2 : 0;
+        if ((block_weight && (ad[0] != 1 || ad[1] != 1 || wd[0] != 1 || wd[1] != 1 || yd[0] != 1 || yd[1] != 1)) ||
+            ad[base+1] != wd[base+1] || yd[base] != ad[base] || yd[base+1] != wd[base] ||
             spec.parameters[0].name != "transpose_in0" || spec.parameters[1].name != "transpose_in1" ||
             spec.parameters[0].value.dataType != QNN_DATATYPE_BOOL_8 || spec.parameters[1].value.dataType != QNN_DATATYPE_BOOL_8 ||
             spec.parameters[0].value.bool8Value != 0 || spec.parameters[1].value.bool8Value != 1) {
             return packet_result::failure(host_error(error_stage::op_validation, "op_packet", "Invalid MatMul shapes or parameters"));
         }
         matmul_spec shape;
-        shape.m = ad[0]; shape.k = ad[1]; shape.n = wd[0];
+        shape.m = ad[base]; shape.k = ad[base+1]; shape.n = wd[base];
         auto admitted = graph.context()->runtime()->policy().admit_matmul(shape);
         if (!admitted.ok()) { return packet_result::failure(admitted.error()); }
     } else if (unary) {

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -66,7 +67,7 @@ class partition_builder final {
 public:
     partition_builder(prepared_run & entry, const std::vector<ggml_tensor *> & nodes, const tensor_inventory & inventory,
                       std::function<std::vector<fp16_bits>(const ggml_tensor *)> pack,
-                      const std::vector<pending_output> & pending) : entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending) {
+                      const std::vector<pending_output> & pending, bool w4fp16) : w4fp16_(w4fp16), entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending) {
         for (const auto * t : nodes) { members_[t] = true; }
     }
     void lower() {
@@ -76,8 +77,10 @@ public:
             if (metadata_op(t->op)) { continue; }
             const auto y = tensor(logical_shape(t), QNN_TENSOR_TYPE_APP_READ);
             entry_.outputs.push_back(y); entry_.partition->output_nodes.push_back(i);
-            auto a = input(t->src[0]);
-            if (t->op == GGML_OP_FLASH_ATTN_EXT) { flash(i,t,a,y); }
+            const auto packed = t->op == GGML_OP_MUL_MAT ? native_weights(t->src[0]) : nullptr;
+            auto a = packed ? null_tensor_id : input(t->src[0]);
+            if (packed) { native_matmul(t,*packed,y); }
+            else if (t->op == GGML_OP_FLASH_ATTN_EXT) { flash(i,t,a,y); }
             else if (t->op == GGML_OP_MUL_MAT) { matmul(t, a, input(t->src[1]), y); }
             else if (t->op == GGML_OP_ROPE) { rope(i, t, a, y); }
             else if (t->op == GGML_OP_SET_ROWS) {
@@ -258,6 +261,25 @@ private:
         if (full!=extent || offset) { reshaped=slice(reshaped,begin,extent); }
         return transpose(reshaped,permutation);
     }
+    std::shared_ptr<const w4_weights> native_weights(const ggml_tensor * t) const {
+        if (!w4fp16_ || !q4_weight_layout(t) || !constant_tensor(t,pending_)) { return nullptr; }
+        const auto b = t->view_src ? t->view_src->buffer : t->buffer;
+        const auto * c = static_cast<const buffer_context *>(b->context);
+        const size_t offset = reinterpret_cast<uintptr_t>(t->data) - reinterpret_cast<uintptr_t>(c->storage);
+        std::lock_guard<std::mutex> lock(c->weights_mutex);
+        const auto found = c->weights.find(offset);
+        return found == c->weights.end() ? nullptr : found->second.upload.get(size_t(t->ne[0]),size_t(t->ne[1]));
+    }
+    void native_matmul(const ggml_tensor * t, const w4_weights & weights, tensor_id y) {
+        const uint32_t k = uint32_t(weights.width), n = uint32_t(weights.rows), m = uint32_t(ggml_nelements(t->src[1]) / k);
+        const auto activation = reshape(input(t->src[1]),{1,1,m,k});
+        tensor_spec spec {"w4weight"+std::to_string(next_tensor_++),QNN_TENSOR_TYPE_STATIC,QNN_DATATYPE_SFIXED_POINT_8,{1,1,n,k},weights.quantization};
+        const auto w = checked(entry_.graph->register_tensor(std::move(spec),{weights.codes.data(),weights.codes.size()}));
+        entry_.static_bytes += weights.bytes();
+        const auto output = tensor({1,1,m,n});
+        add(op_spec::matmul(activation,w,output));
+        reshape(output,logical_shape(t),y); ++entry_.partition->w4_matmuls;
+    }
     void matmul(const ggml_tensor * t,tensor_id a,tensor_id b,tensor_id y) {
         const auto * left=t->src[0];const auto * right=t->src[1];
         const uint32_t k=uint32_t(left->ne[0]),n=uint32_t(left->ne[1]),m=uint32_t(right->ne[1]);
@@ -311,6 +333,7 @@ private:
         add(op_spec::rotary_embedding(transposed,cosine,sine,rotated,uint32_t(p.dimensions),p.mode==GGML_ROPE_TYPE_NORMAL));
         const auto restored=transpose(rotated,{0,2,1,3});reshape(restored,shape,y);
     }
+    bool w4fp16_ = false;
     prepared_run & entry_;
     const std::vector<ggml_tensor *> & nodes_;
     const tensor_inventory & inventory_;
@@ -326,7 +349,7 @@ private:
 status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,std::vector<pending_output> & pending) {
     try {
         tensor_inventory inventory(nodes);
-        std::vector<uint64_t> key {0x504152544954494fULL,1,nodes.size(),inventory.tensors.size()};
+        std::vector<uint64_t> key {0x504152544954494fULL,2,uint64_t(runtime_->config().enable_w4fp16),nodes.size(),inventory.tensors.size()};
         for (const auto * t:inventory.tensors) {
             key.push_back(t->op);key.push_back(t->type);key.push_back(t->view_offs);
             for(size_t i=0;i<4;++i){key.push_back(t->ne[i]);key.push_back(t->nb[i]);}
@@ -343,20 +366,28 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
         for(size_t i=0;i<cache_.size();++i){if(cache_[i]->key==key){auto hit=std::move(cache_[i]);cache_.erase(cache_.begin()+i);cache_.push_back(std::move(hit));entry=cache_.back().get();++stats_.cache_hits;break;}}
         if(!entry) {
             if(!reserve_cache(0)){throw partition_error("Graph cache limit");}
+            const auto preparation_start = std::chrono::steady_clock::now();
             auto fresh=std::make_unique<prepared_run>();fresh->key=std::move(key);fresh->partition=std::make_unique<partition_data>();
             fresh->graph=checked(graph_owner::create(checked(context_owner::create(runtime_)),"connected_partition"));
-            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending);
+            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,runtime_->config().enable_w4fp16);
             builder.lower();
             if(!reserve_cache(fresh->static_bytes)){throw partition_error("Static partition payload exceeds cache limit");}
-            checked(fresh->graph->finalize());
+            const auto finalization_start = std::chrono::steady_clock::now();
+            const auto finalized = fresh->graph->finalize();
+            const auto preparation_end = std::chrono::steady_clock::now();
+            stats_.preparation_time_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(preparation_end - preparation_start).count());
+            stats_.finalization_time_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(preparation_end - finalization_start).count());
+            stats_.finalization_failures += !finalized.ok();
+            checked(finalized);
             if(runtime_->config().verbose_diagnostics) {
-                GGML_LOG_INFO("qairt: connected graph GGML=%zu QNN=%zu outputs=%zu first=%s last=%s\n",nodes.size(),fresh->partition->qnn_nodes,
-                    fresh->outputs.size(),ggml_get_name(nodes.front()),ggml_get_name(nodes.back()));
+                GGML_LOG_INFO("qairt: connected graph GGML=%zu QNN=%zu outputs=%zu W4=%zu first=%s last=%s\n",nodes.size(),fresh->partition->qnn_nodes,
+                    fresh->outputs.size(),fresh->partition->w4_matmuls,ggml_get_name(nodes.front()),ggml_get_name(nodes.back()));
                 for(const auto & span:fresh->partition->spans) {
                     GGML_LOG_INFO("qairt: partition span node=%zu name=%s ggml=%s first=%zu count=%zu\n",span.node,
                         ggml_get_name(nodes[span.node]),ggml_op_name(nodes[span.node]->op),span.first_op,span.count);
                 }
             }
+            stats_.w4_preparations += fresh->partition->w4_matmuls;
             cache_.push_back(std::move(fresh));entry=cache_.back().get();++stats_.preparations;
         }
         // Refresh selected position tables; cache owns values, never GGML tensor pointers.
@@ -434,7 +465,7 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
         std::vector<std::vector<fp16_bits>> outputs;outputs.reserve(entry->outputs.size());
         for(size_t i=0;i<entry->outputs.size();++i){outputs.emplace_back(size_t(ggml_nelements(nodes[entry->partition->output_nodes[i]])));
             checked(binding->bind_output(entry->outputs[i],{outputs.back().data(),outputs.back().size()*2}));}
-        checked(entry->graph->execute(*binding));++stats_.executions;
+        checked(entry->graph->execute(*binding));++stats_.executions;stats_.w4_executions+=entry->partition->w4_matmuls;
         for(size_t i=0;i<outputs.size();++i){auto * t=nodes[entry->partition->output_nodes[i]];std::vector<uint8_t> bytes(dense_bytes(t));
             for(size_t j=0;j<outputs[i].size();++j){const float value=ggml_fp16_to_fp32(outputs[i][j].bits);
                 if(!std::isfinite(value)){throw partition_error("Nonfinite partition output");}

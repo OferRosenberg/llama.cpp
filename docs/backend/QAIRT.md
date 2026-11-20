@@ -6,7 +6,7 @@ On November 19, 2026, the user accepted the FP16-emulated short/long results as 
 
 All local projection NMSE, relative-error, final-logit and greedy-token checks pass. The 15 short and 14 long absolute intermediate-error failures remain documented exceptions: FFN down-projection output, attention residual output and final residual output. Original numerical thresholds, measured results and test exit behavior remain unchanged. This is approval to progress with known accuracy exceptions, not a claim of universal model or device qualification.
 
-The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. Numerical QNN weights, activations, intermediates and outputs use FP16. Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
+The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. By default, numerical QNN weights, activations, intermediates and outputs use FP16. Opt-in `GGML_QAIRT_W4FP16=1` uses native block-quantized Q4_0 projection weights with FP16 activations and outputs; see [runtime W4FP16 weights](QAIRT-w4fp16.md). Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
 
 ## Build and runtime
 
@@ -22,7 +22,7 @@ ctest --test-dir C:\Github\qairt-qwen3-m2-arm64 -C Release -R '^qairt-' --output
 
 GGML_QAIRT defaults OFF. Disabled builds do not require the SDK. SDK headers remain private; provider libraries load from the configured absolute directory. Backend registration follows ordinary GGML static/shared/module integration. GGML_BACKEND_DL=ON requires BUILD_SHARED_LIBS=ON. Installed static packaging is not separately qualified.
 
-GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. Invalid values fail configuration.
+GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. GGML_QAIRT_W4FP16=0|1 enables upload-time weight repacking and native HTP W4FP16 MatMul; default 0, HTP V69+ required. Set before discovery/model loading. Invalid values fail configuration.
 
 ## Admitted operation families
 
@@ -30,7 +30,7 @@ Support is bounded by shape, representation, precision, buffer and staging check
 
 | GGML operation | QNN HTP recipe |
 |---|---|
-| MUL_MAT, F32/F16 or admitted Q4_0 source weights | FP16 MatMul; original Q4_0 rows decode to FP16 on host |
+| MUL_MAT, F32/F16 or admitted Q4_0 source weights | FP16 MatMul by default; opt-in W4FP16 supplies initialized STATIC signed-byte block weights for eligible Q4_0 projections |
 | Grouped/batched floating MUL_MAT | In-graph StridedSlice / rank-two MatMul per head / Concat with explicit KV-group mapping |
 | ADD / MUL | FP16 ElementWiseAdd / ElementWiseMultiply; admitted F32/F16 boundaries and singleton broadcasting |
 | RMS_NORM / NORM | RMSNorm / LayerNorm over final feature axis; flatten/factor independent rows into rank four |
@@ -54,9 +54,9 @@ Quantized fused MaskSoftmax is not assumed. Mask -infinity becomes -65504, with 
 
 ## Buffers, preparation and state
 
-Original GGML buffers preserve their source representations, including Q4_0 bytes. QAIRT storage is aligned host-accessible memory and reports is_host=true. Validated host buffer types, including CPU buffers, are accepted directly by the scheduler. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
+Original GGML buffers preserve their source representations, including Q4_0 bytes. QAIRT storage is aligned host-accessible memory. It reports is_host=true by default; W4FP16 mode reports is_host=false to require upload callbacks during model loading, with ordinary GGML transfers for CPU consumers. Validated host buffer types, including CPU buffers, are accepted directly by the scheduler. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
 
-Q4_0 rows decode through GGML type traits with bounded F32 scratch and FP16 staging. Dynamic numerical inputs convert directly to FP16 for every execution. Tracked QAIRT WEIGHTS allocations can supply STATIC QNN data. Allocation identity/generation/offset enter preparation identity; mutations force reprepare. Untracked sources are rebound as APP_WRITE. STATIC registration uses the released API's copied-payload contract.
+Default Q4_0 rows decode through GGML type traits with bounded F32 scratch and FP16 staging. W4FP16 mode repacks eligible weights into immutable buffer-owned signed-byte/block-metadata sidecars during upload; graph-local metadata copies prevent SDK registration from mutating shared state. Graph construction reuses sidecars and keeps FP16 fallback for other sources. Dynamic numerical inputs convert directly to FP16 for every execution. Tracked QAIRT WEIGHTS allocations can supply STATIC QNN data. Allocation identity/generation/offset enter preparation identity; mutations force reprepare. Untracked sources are rebound as APP_WRITE. STATIC registration uses the released API's copied-payload contract.
 
 prepared_run owns finalized graph/context references, boundary input IDs, output IDs and optional RoPE tables. Structural keys include types, shapes, strides, parameters, topology, FP16 recipe and tracked source identity. Activations, indices and masks refresh on cache hits. A shared partition_builder lowers connected operators, branches, compatible metadata views and transactional KV writes into one graph. Grouped attention uses in-graph head slices, MatMuls and Concat. Every GGML numerical output remains readable; temporary decomposition tensors are NATIVE. graph_optimize retains readable node buffers through partition completion using add_alloc_dep.
 

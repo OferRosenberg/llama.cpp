@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-model.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -22,7 +23,7 @@ using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
 static void logger(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span")) { std::fputs(text, stderr); }
+    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
 }
 struct observation;
 static bool observe(ggml_tensor *, bool, void *);
@@ -96,6 +97,11 @@ private:
         active_->graph_counts.preparations += after.preparations - before.preparations;
         active_->graph_counts.cache_hits += after.cache_hits - before.cache_hits;
         active_->graph_counts.executions += after.executions - before.executions;
+        active_->graph_counts.w4_preparations += after.w4_preparations - before.w4_preparations;
+        active_->graph_counts.w4_executions += after.w4_executions - before.w4_executions;
+        active_->graph_counts.preparation_time_us += after.preparation_time_us - before.preparation_time_us;
+        active_->graph_counts.finalization_time_us += after.finalization_time_us - before.finalization_time_us;
+        active_->graph_counts.finalization_failures += after.finalization_failures - before.finalization_failures;
         if (status == GGML_STATUS_SUCCESS) {
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto * t = ggml_graph_node(graph, i);
@@ -428,8 +434,20 @@ int main(int argc, char ** argv) {
             patterns.push_back("^blk\\." + std::to_string(layer) + "\\." + name + "\\.weight$");
         } }
     }
+    std::vector<std::string> cpu_patterns;
+    // Explicit overrides must preserve CPU fallback for unsupported Q4_1 projections.
+    // W4 QAIRT buffers are backend-managed and cannot serve as CPU-owned weight buffers.
+    for (const auto & item : reference->tensors_by_name) {
+        if (item.second->type != GGML_TYPE_Q4_1) { continue; }
+        std::string pattern = "^";
+        for (const char ch : item.first) { if (ch == '.') { pattern += '\\'; } pattern += ch; }
+        pattern += '$'; cpu_patterns.push_back(std::move(pattern));
+    }
     std::vector<llama_model_tensor_buft_override> overrides;
-    if (htp) { for (const auto & pattern : patterns) { overrides.push_back({pattern.c_str(), ggml_backend_dev_buffer_type(htp)}); } }
+    if (htp) {
+        for (const auto & pattern : cpu_patterns) { overrides.push_back({pattern.c_str(), ggml_backend_cpu_buffer_type()}); }
+        for (const auto & pattern : patterns) { overrides.push_back({pattern.c_str(), ggml_backend_dev_buffer_type(htp)}); }
+    }
     overrides.push_back({nullptr, nullptr});
     ggml_backend_dev_t devices[] = {htp, nullptr};
     mp.n_gpu_layers = !opt.control && opt.all ? opt.layers + 1 : 0;
@@ -497,7 +515,25 @@ int main(int argc, char ** argv) {
             CHECK(nodes == size_t((26 * opt.layers + 4 - cpu_projections) * (opt.control ? 2 : 1)));
         }
         CHECK(cpu_status == 0 && actual_status == 0);
-        if (cpu_status || actual_status) { std::fprintf(stderr, "Model decode failed; remaining comparisons invalid.\n"); decode_failed = true; return llama_token(0); }
+        if (cpu_status || actual_status) {
+            if (executed) {
+                std::printf("%s QNN graphs created=%llu cache_hits=%llu executions=%llu finalization_failures=%llu\n", label,
+                            (unsigned long long) executed->graph_counts.preparations,
+                            (unsigned long long) executed->graph_counts.cache_hits,
+                            (unsigned long long) executed->graph_counts.executions,
+                            (unsigned long long) executed->graph_counts.finalization_failures);
+                std::printf("%s QNN compilation preparation_us=%llu finalization_us=%llu\n", label,
+                            (unsigned long long) executed->graph_counts.preparation_time_us,
+                            (unsigned long long) executed->graph_counts.finalization_time_us);
+                std::printf("%s W4FP16 preparations=%llu executions=%llu\n", label,
+                            (unsigned long long) executed->graph_counts.w4_preparations,
+                            (unsigned long long) executed->graph_counts.w4_executions);
+            }
+            std::printf("Model failure: cpu_status=%d actual_status=%d failures=%d\n", cpu_status, actual_status, failures);
+            std::fflush(stdout);
+            std::fprintf(stderr, "Model decode failed; remaining comparisons invalid.\n");
+            decode_failed = true; return llama_token(0);
+        }
         position += int(input.size());
         const float * cpu = llama_get_logits_ith(cpu_ctx.get(), -1), * hybrid = llama_get_logits_ith(actual_ctx.get(), -1);
         CHECK(cpu && hybrid); if (!cpu || !hybrid) { return llama_token(0); }
@@ -531,6 +567,15 @@ int main(int argc, char ** argv) {
                         (unsigned long long) executed->graph_counts.preparations,
                         (unsigned long long) executed->graph_counts.cache_hits,
                         (unsigned long long) executed->graph_counts.executions);
+            std::printf("%s QNN compilation preparation_us=%llu finalization_us=%llu\n", label,
+                        (unsigned long long) executed->graph_counts.preparation_time_us,
+                        (unsigned long long) executed->graph_counts.finalization_time_us);
+            if (std::strstr(ggml_backend_dev_description(htp),"W4FP16")) {
+                CHECK(executed->graph_counts.w4_executions == uint64_t(htp_projections));
+            }
+            std::printf("%s W4FP16 preparations=%llu executions=%llu\n", label,
+                        (unsigned long long) executed->graph_counts.w4_preparations,
+                        (unsigned long long) executed->graph_counts.w4_executions);
         }
         if (executed && opt.all) {
             for (const auto & op : executed->operations) {
