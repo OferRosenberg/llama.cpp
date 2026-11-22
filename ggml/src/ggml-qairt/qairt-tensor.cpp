@@ -35,7 +35,7 @@ result<size_t> tensor_record::checked_bytes(const tensor_spec & spec) {
     }
     if (block_weight) {
         for (const auto & scale : spec.quantization->scales) {
-            if (!std::isfinite(scale.scale) || scale.scale <= 0 || (scale.offset != 0 && scale.offset != 1)) {
+            if (!std::isfinite(scale.scale) || scale.scale <= 0 || !std::isfinite(scale.offset)) {
                 return result<size_t>::failure(host_error(error_stage::tensor_registration, "tensor", "Invalid W4FP16 scale or offset"));
             }
         }

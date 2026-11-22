@@ -8,6 +8,8 @@
 
 namespace ggml::qairt {
 
+const char * diagnostic_phase() noexcept;
+
 struct provider_identity {
     uint32_t backend_id = 0;
     Qnn_ApiVersion_t version {};
@@ -185,6 +187,8 @@ public:
     status close();
     bool closed() const noexcept { return closed_; }
     result<uint32_t> profile_event_count();
+    QnnLog_Level_t log_level() const noexcept { return log_level_; }
+    status set_log_level(QnnLog_Level_t level);
 private:
     friend class runtime_factory;
     friend class context_owner;
@@ -198,6 +202,7 @@ private:
     platform_snapshot platform_;
     uint32_t active_contexts_ = 0;
     bool closed_ = false;
+    QnnLog_Level_t log_level_ = QNN_LOG_LEVEL_WARN;
     const QnnDevice_PlatformInfo_t * platform_info_ = nullptr;
     Qnn_ErrorHandle_t platform_free_error_ = QNN_SUCCESS;
     unique_qnn_handle<log_tag> log_;

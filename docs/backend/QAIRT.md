@@ -6,7 +6,7 @@ On November 19, 2026, the user accepted the FP16-emulated short/long results as 
 
 All local projection NMSE, relative-error, final-logit and greedy-token checks pass. The 15 short and 14 long absolute intermediate-error failures remain documented exceptions: FFN down-projection output, attention residual output and final residual output. Original numerical thresholds, measured results and test exit behavior remain unchanged. This is approval to progress with known accuracy exceptions, not a claim of universal model or device qualification.
 
-The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. By default, numerical QNN weights, activations, intermediates and outputs use FP16. Opt-in `GGML_QAIRT_W4FP16=1` uses native block-quantized Q4_0 projection weights with FP16 activations and outputs; see [runtime W4FP16 weights](QAIRT-w4fp16.md). Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
+The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. By default, numerical QNN weights, activations, intermediates and outputs use FP16. Opt-in `GGML_QAIRT_W4FP16=1` uses native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs; see [runtime W4FP16 weights](QAIRT-w4fp16.md). Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
 
 ## Build and runtime
 
@@ -22,7 +22,7 @@ ctest --test-dir C:\Github\qairt-qwen3-m2-arm64 -C Release -R '^qairt-' --output
 
 GGML_QAIRT defaults OFF. Disabled builds do not require the SDK. SDK headers remain private; provider libraries load from the configured absolute directory. Backend registration follows ordinary GGML static/shared/module integration. GGML_BACKEND_DL=ON requires BUILD_SHARED_LIBS=ON. Installed static packaging is not separately qualified.
 
-GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. GGML_QAIRT_W4FP16=0|1 enables upload-time weight repacking and native HTP W4FP16 MatMul; default 0, HTP V69+ required. Set before discovery/model loading. Invalid values fail configuration.
+GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. GGML_QAIRT_W4FP16=0|1 enables upload-time weight repacking and native HTP W4FP16 MatMul; default 0, HTP V69+ required. Set before discovery/model loading. Invalid values fail configuration. Experimental `GGML_QAIRT_APP_WRITE_WEIGHTS=0|1` registers model weights as FP16 execution inputs. `GGML_QAIRT_SHARE_WEIGHT_GRAPHS=0|1` additionally shares structurally compatible graphs across weight allocations and requires APP_WRITE. Both default to 0 and are incompatible with native W4FP16; this HTP SDK requires STATIC BW_FLOAT_BLOCK weights. See [APP_WRITE graph reuse experiments](QAIRT-appwrite-graphs.md).
 
 ## Admitted operation families
 
@@ -30,7 +30,7 @@ Support is bounded by shape, representation, precision, buffer and staging check
 
 | GGML operation | QNN HTP recipe |
 |---|---|
-| MUL_MAT, F32/F16 or admitted Q4_0 source weights | FP16 MatMul by default; opt-in W4FP16 supplies initialized STATIC signed-byte block weights for eligible Q4_0 projections |
+| MUL_MAT, F32/F16 or admitted Q4_0/Q4_1 source weights | FP16 MatMul by default; opt-in W4FP16 supplies initialized STATIC signed-byte block weights for eligible Q4_0/Q4_1 projections |
 | Grouped/batched floating MUL_MAT | In-graph StridedSlice / rank-two MatMul per head / Concat with explicit KV-group mapping |
 | ADD / MUL | FP16 ElementWiseAdd / ElementWiseMultiply; admitted F32/F16 boundaries and singleton broadcasting |
 | RMS_NORM / NORM | RMSNorm / LayerNorm over final feature axis; flatten/factor independent rows into rank four |
@@ -44,19 +44,19 @@ Support is bounded by shape, representation, precision, buffer and staging check
 | VIEW / RESHAPE / TRANSPOSE / PERMUTE | GGML metadata aliases and stride handling |
 | CONT / DUP / CPY | In-graph Reshape / StridedSlice / Transpose; preserve GGML destination representation |
 
-Projection shapes: source weights ne=[K,N], activation ne=[K,T], destination ne=[N,T]; QNN weights [N,K], input [T,K], output [T,N]. MatMul uses transpose_in0=false and transpose_in1=true. Q4_0 K must be divisible by 32; source rows must satisfy the admitted layout.
+Projection shapes: source weights ne=[K,N], activation ne=[K,T], destination ne=[N,T]; QNN weights [N,K], input [T,K], output [T,N]. MatMul uses transpose_in0=false and transpose_in1=true. Q4_0/Q4_1 K must be divisible by 32; source rows must satisfy the admitted layout.
 
 Normalization maps feature D to axis 3 in [1,H,R/H,D]. RoPE receives [B,H,T,D], with rank-three cosine/sine [B,T,rotary_dim/2]; QNN Transposes adapt dense [B,T,H,D]. Normal/interleaved and NEOX modes are admitted with checked parameters. Unsupported RoPE variants/offsets remain rejected.
 
-F32 numerical boundaries must be finite and representable in FP16. FP16 outputs widen to F32 when required. Gather/ScatterNd INT32 tensors are control metadata; INT64 scatter indices are checked and narrowed. There is no native QNN BF16 numerical tensor path. Floating MatMul accepts default/F32/BF16 accumulation hints with FP16 operands; explicit source precision overrides and nondefault accumulation for Q4_0 projections remain rejected. QNN tensor dtype does not guarantee a particular internal accumulator implementation.
+F32 numerical boundaries must be finite and representable in FP16. FP16 outputs widen to F32 when required. Gather/ScatterNd INT32 tensors are control metadata; INT64 scatter indices are checked and narrowed. There is no native QNN BF16 numerical tensor path. Floating MatMul accepts default/F32/BF16 accumulation hints with FP16 operands; explicit source precision overrides and nondefault accumulation for Q4_0/Q4_1 projections remain rejected. QNN tensor dtype does not guarantee a particular internal accumulator implementation.
 
 Quantized fused MaskSoftmax is not assumed. Mask -infinity becomes -65504, with unmasked-finite-row validation before execution. All-masked rows, unsupported broadcasting/variants and other source-weight formats remain rejected. SUB/DIV are not advertised as GGML operations merely because private QNN packet validation recognizes them.
 
 ## Buffers, preparation and state
 
-Original GGML buffers preserve their source representations, including Q4_0 bytes. QAIRT storage is aligned host-accessible memory. It reports is_host=true by default; W4FP16 mode reports is_host=false to require upload callbacks during model loading, with ordinary GGML transfers for CPU consumers. Validated host buffer types, including CPU buffers, are accepted directly by the scheduler. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
+Original GGML buffers preserve their source representations, including Q4_0/Q4_1 bytes. QAIRT storage is aligned host-accessible memory. It reports is_host=true by default; W4FP16 mode reports is_host=false to require upload callbacks during model loading, with ordinary GGML transfers for CPU consumers. Validated host buffer types, including CPU buffers, are accepted directly by the scheduler. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
 
-Default Q4_0 rows decode through GGML type traits with bounded F32 scratch and FP16 staging. W4FP16 mode repacks eligible weights into immutable buffer-owned signed-byte/block-metadata sidecars during upload; graph-local metadata copies prevent SDK registration from mutating shared state. Graph construction reuses sidecars and keeps FP16 fallback for other sources. Dynamic numerical inputs convert directly to FP16 for every execution. Tracked QAIRT WEIGHTS allocations can supply STATIC QNN data. Allocation identity/generation/offset enter preparation identity; mutations force reprepare. Untracked sources are rebound as APP_WRITE. STATIC registration uses the released API's copied-payload contract.
+Default Q4_0/Q4_1 rows decode through GGML type traits with bounded F32 scratch and FP16 staging. W4FP16 mode repacks eligible weights into immutable buffer-owned signed-byte/block-metadata sidecars during upload; graph-local metadata copies prevent SDK registration from mutating shared state. Graph construction reuses sidecars and keeps FP16 fallback for other sources. Dynamic numerical inputs convert directly to FP16 for every execution. Tracked QAIRT WEIGHTS allocations can supply STATIC QNN data. Allocation identity/generation/offset enter preparation identity; mutations force reprepare. Untracked sources are rebound as APP_WRITE. STATIC registration uses the released API's copied-payload contract.
 
 prepared_run owns finalized graph/context references, boundary input IDs, output IDs and optional RoPE tables. Structural keys include types, shapes, strides, parameters, topology, FP16 recipe and tracked source identity. Activations, indices and masks refresh on cache hits. A shared partition_builder lowers connected operators, branches, compatible metadata views and transactional KV writes into one graph. Grouped attention uses in-graph head slices, MatMuls and Concat. Every GGML numerical output remains readable; temporary decomposition tensors are NATIVE. graph_optimize retains readable node buffers through partition completion using add_alloc_dep.
 
@@ -108,7 +108,7 @@ All numerical QNN edges remain FP16 inside the graph. Application-readable GGML 
 
 ## FP16-emulated model reference
 
-Add `--fp16-reference` to `test-qairt-model MODEL --fused` for a precision-emulated CPU reference in block 27 and final RMSNorm/scale. Earlier CPU blocks and the output head retain their existing behavior. The test decodes Q4_0 weights to FP16-rounded floating values, rounds numerical inputs/outputs at operator boundaries, and executes F32 CPU arithmetic internally. Masked Softmax and SwiGLU also round their decomposition intermediates. CPU RoPE retains internal F32 trigonometric evaluation; this is not a reproduction of native QNN internal arithmetic.
+Add `--fp16-reference` to `test-qairt-model MODEL --fused` for a precision-emulated CPU reference in block 27 and final RMSNorm/scale. Earlier CPU blocks and the output head retain their existing behavior. The test decodes Q4_0/Q4_1 weights to FP16-rounded floating values, rounds numerical inputs/outputs at operator boundaries, and executes F32 CPU arithmetic internally. Masked Softmax and SwiGLU also round their decomposition intermediates. CPU RoPE retains internal F32 trigonometric evaluation; this is not a reproduction of native QNN internal arithmetic.
 
 The short/long FP16 reference controls match exactly. All local projection NMSE checks pass (worst 1.03446516e-9 / 6.75396652e-10); logit maxabs is 0.160899878 / 0.292719841. Fifteen/fourteen intermediate comparisons still exceed the unchanged maxabs limit of 0.75, while relative RMSE checks pass. Progression is accepted with these documented accuracy exceptions. Without the flag, the original CPU reference and results remain available. `test-qairt-model --fp16-reference-self-test` exercises the emulation without loading a model.
 
@@ -121,3 +121,32 @@ With `--fused --fp16-reference --offload-last all --decode-steps 20 --prompt 'Ex
 Known numerical and fixture gaps remain: decode13/decode17 KL is 0.00659981862/0.00163475668 against 0.001; worst intermediate maxabs is 16 against 0.75, and worst relative RMSE is 0.108090024 against 0.02. The executable returns one with 1,948 assertions: 1,880 checkpoint accuracy assertions, 66 unmatched-reference-key assertions (three per frame), and two logit assertions. Matching generated text does not establish that these numerical gates pass.
 
 Each frame executes 193 Q4_0 projections and 508 other numerical operations on HTP across 31 QNN executions, with 29 preparations and two cache hits. Q4_1 FFN-down projections in blocks 0-2 and Q6_K embedding/output remain on CPU. The 1 GiB static cache budget causes repeated graph preparation. ARM64 Release builds and all 14 QAIRT CTests passed after this model run.
+
+## Q4_1 FFN qualification (November 21, 2026)
+
+The runtime W4 path now repacks Q4_1 asymmetric blocks with finite floating offsets. Qwen3 block-2 FFN uses Q4_0 gate/up and Q4_1 down projections in one reusable QNN graph. Actual-weight M=1 and M=23 validation passes every intermediate checkpoint against both FP16 baselines at NMSE <= 1e-5. The model harness no longer forces these Q4_1 projections onto CPU. Prior full-model/cache-boundary measurements above describe the earlier Q4_0-only implementation and have not been repeated for the new graph topology.
+
+Enable optional model-weight CTests with `-DGGML_QAIRT_TEST_MODEL=C:/Models/Qwen3-1.7B-Q4_0.gguf`. Synthetic FFN diagnostics remain available and can exceed the unchanged intermediate accuracy budget. See `QAIRT-w4fp16.md` for the encoding contract and limits.
+
+## Shared contexts and preparation diagnostics
+
+Experimental `GGML_QAIRT_SHARED_CONTEXT=1` places cached partitions in one QNN context, with unique graph names. The default remains one context per cached graph. QNN graph tensors remain graph-scoped; sharing a context does not deduplicate registered STATIC weights. Individual eviction is disabled in shared-context mode because the SDK releases these graph resources only through `contextFree`. Backend invalidation clears graph owners before releasing the shared context. The 4 GiB cache budget is host-side logical STATIC-payload accounting, not measured HTP PD occupancy.
+
+The following diagnostics remain opt-in:
+
+| Control | Retained information | Cost and limits |
+|---|---|---|
+| Backend graph statistics | Preparation count/time, finalization time/failures, cache hits and executions | No context serialization required |
+| `test-qairt-model --qnn-prepare-probe` | Prefill plus the first teacher-forced decode; stop on execution failure; graph/context correlation, partition payload and tensor-role totals | Includes CPU reference and unchanged accuracy assertions; successful preparation can still return 1 for numerical failures |
+| First-decode probe phase | QNN DEBUG logging during `decode0`, with the previous SDK level restored afterward | Can produce substantial SDK output; other probe phases start at WARN |
+| `GGML_QAIRT_MEMORY_PROBE=1` | Context binary size and the newly finalized graph's `opDataSize`, `constSize`, `ddrTensorSize`, `sharedWeightsSize`, `ioTensorSize` and spill/fill size | Serializes the entire current context after each successful finalization; temporary host memory and significant runtime cost |
+
+The memory probe uses the released SDK's System binary metadata and HTP V2 blob extension. It reports only the newly finalized graph, avoiding repeated rows for earlier graphs in a shared context. Unsupported metadata layouts are skipped. These fields are compiled-memory estimates, not a query of free PD space or a measurement of total live PD allocation. Keep this probe disabled for accuracy qualification and performance measurements.
+
+Temporary per-tensor payload/address dumps, tensor topology dumps and per-node connection dumps have been removed. Aggregate preparation diagnostics retain the evidence needed for the upcoming context-binary experiment.
+
+Retain the host configuration/admission/packing tests, individual HTP operator tests, Q4_0/Q4_1 W4 tests, distinct-allocation APP_WRITE A/B/A/mutation tests and direct FP16 STATIC-versus-APP_WRITE test. Each covers a separate supported behavior. The mixed Q4_0 gate/up plus Q4_1 down FFN fixture additionally validates connected graph lowering and intermediate accuracy. Its actual-model M=1/M=23 CTests remain optional through `GGML_QAIRT_TEST_MODEL`; large full-model preparation probes and cancellation-stress fixtures are manual diagnostics.
+
+PD0 exhaustion remains a working hypothesis. Online graph finalization does not use the binary-deserialization PD selection path. Generating and loading context binaries is the next experiment, subject to the installed Windows driver's multi-PD support. No binary-loading or automatic context-rollover implementation is included in this checkpoint.
+
+Cleanup validation on November 22, 2026: ARM64 Release build succeeded; all 25 QAIRT CTests passed, including the optional actual-model FFN cases. A small shared-context APP_WRITE probe finalized three graphs, emitted exactly one memory-metadata row per graph, and passed all 323 checks with zero numerical error. This validates the diagnostic path, not the full-model PD-exhaustion hypothesis.

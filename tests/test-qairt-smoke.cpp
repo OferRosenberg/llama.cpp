@@ -28,6 +28,16 @@ static int failures = 0;
 } while (0)
 
 static void test_configuration() {
+    _wputenv_s(L"GGML_QAIRT_LIBRARY_DIR", L"C:\\QNN");
+    _putenv_s("GGML_QAIRT_SHARED_CONTEXT", "invalid");
+    CHECK(!config_parser::from_environment().ok());
+    _putenv_s("GGML_QAIRT_SHARED_CONTEXT", "1");
+    auto shared = config_parser::from_environment();
+    CHECK(shared.ok() && shared.value().shared_context);
+    _putenv_s("GGML_QAIRT_SHARED_CONTEXT", "0");
+    auto separate = config_parser::from_environment();
+    CHECK(separate.ok() && !separate.value().shared_context);
+    _putenv_s("GGML_QAIRT_SHARED_CONTEXT", "");
     auto htp = config_parser::parse_target("HTP");
     CHECK(htp.ok());
     if (htp.ok()) { CHECK(htp.value() == target_kind::htp); }

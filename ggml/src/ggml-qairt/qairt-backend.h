@@ -80,7 +80,7 @@ public:
     backend_context(const backend_context &) = delete;
     backend_context & operator=(const backend_context &) = delete;
     ggml_status compute(ggml_cgraph * graph);
-    void invalidate() noexcept { cache_.clear(); }
+    void invalidate() noexcept { cache_.clear(); shared_context_.reset(); }
     ggml_backend_qairt_stats stats() const noexcept { return stats_; }
 private:
     result<std::vector<fp16_bits>> pack(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
@@ -89,6 +89,8 @@ private:
     status run_partition(const std::vector<ggml_tensor *> & nodes, std::vector<pending_output> & pending);
     bool reserve_cache(size_t additional, const prepared_run * keep = nullptr);
     std::shared_ptr<runtime_owner> runtime_;
+    std::shared_ptr<context_owner> shared_context_;
+    uint64_t next_graph_name_ = 0;
     std::vector<std::unique_ptr<prepared_run>> cache_;
     ggml_backend_qairt_stats stats_ {};
 };

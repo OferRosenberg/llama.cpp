@@ -67,7 +67,7 @@ class partition_builder final {
 public:
     partition_builder(prepared_run & entry, const std::vector<ggml_tensor *> & nodes, const tensor_inventory & inventory,
                       std::function<std::vector<fp16_bits>(const ggml_tensor *)> pack,
-                      const std::vector<pending_output> & pending, bool w4fp16) : w4fp16_(w4fp16), entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending) {
+                      const std::vector<pending_output> & pending, bool w4fp16, bool app_write_weights) : w4fp16_(w4fp16), app_write_weights_(app_write_weights), entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending) {
         for (const auto * t : nodes) { members_[t] = true; }
     }
     void lower() {
@@ -171,7 +171,7 @@ private:
     }
     tensor_id external(const ggml_tensor * t, partition_input_kind kind, size_t node, std::vector<uint32_t> shape) {
         const auto dtype = (kind == partition_input_kind::indices || kind == partition_input_kind::scatter_indices) ? QNN_DATATYPE_INT_32 : QNN_DATATYPE_FLOAT_16;
-        const bool weight = kind == partition_input_kind::numerical && constant_tensor(t,pending_);
+        const bool weight = !app_write_weights_ && kind == partition_input_kind::numerical && constant_tensor(t,pending_);
         tensor_spec spec {"input"+std::to_string(next_tensor_++),weight ? QNN_TENSOR_TYPE_STATIC : QNN_TENSOR_TYPE_APP_WRITE,dtype,std::move(shape)};
         tensor_id id;
         if (weight) {
@@ -268,7 +268,7 @@ private:
         const size_t offset = reinterpret_cast<uintptr_t>(t->data) - reinterpret_cast<uintptr_t>(c->storage);
         std::lock_guard<std::mutex> lock(c->weights_mutex);
         const auto found = c->weights.find(offset);
-        return found == c->weights.end() ? nullptr : found->second.upload.get(size_t(t->ne[0]),size_t(t->ne[1]));
+        return found == c->weights.end() ? nullptr : found->second.upload.get(size_t(t->ne[0]),size_t(t->ne[1]),t->type);
     }
     void native_matmul(const ggml_tensor * t, const w4_weights & weights, tensor_id y) {
         const uint32_t k = uint32_t(weights.width), n = uint32_t(weights.rows), m = uint32_t(ggml_nelements(t->src[1]) / k);
@@ -334,6 +334,7 @@ private:
         const auto restored=transpose(rotated,{0,2,1,3});reshape(restored,shape,y);
     }
     bool w4fp16_ = false;
+    bool app_write_weights_ = false;
     prepared_run & entry_;
     const std::vector<ggml_tensor *> & nodes_;
     const tensor_inventory & inventory_;
@@ -349,14 +350,14 @@ private:
 status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,std::vector<pending_output> & pending) {
     try {
         tensor_inventory inventory(nodes);
-        std::vector<uint64_t> key {0x504152544954494fULL,2,uint64_t(runtime_->config().enable_w4fp16),nodes.size(),inventory.tensors.size()};
+        std::vector<uint64_t> key {0x504152544954494fULL,3,uint64_t(runtime_->config().enable_w4fp16),uint64_t(runtime_->config().app_write_weights),uint64_t(runtime_->config().share_weight_graphs),nodes.size(),inventory.tensors.size()};
         for (const auto * t:inventory.tensors) {
             key.push_back(t->op);key.push_back(t->type);key.push_back(t->view_offs);
             for(size_t i=0;i<4;++i){key.push_back(t->ne[i]);key.push_back(t->nb[i]);}
             for(size_t i=0;i<sizeof(t->op_params)/4;++i){uint32_t word;std::memcpy(&word,reinterpret_cast<const uint8_t *>(t->op_params)+i*4,4);key.push_back(word);}
             for(const auto * source:t->src){const auto found=inventory.slots.find(source);key.push_back(found==inventory.slots.end()?SIZE_MAX:found->second);}
             const auto parent=inventory.slots.find(t->view_src);key.push_back(parent==inventory.slots.end()?SIZE_MAX:parent->second);
-            if(constant_tensor(t,pending)) {
+            if(constant_tensor(t,pending) && !runtime_->config().share_weight_graphs) {
                 const auto buffer=t->view_src?t->view_src->buffer:t->buffer;const auto * allocation=static_cast<const buffer_context *>(buffer->context);
                 key.push_back(1);key.push_back(allocation->identity);key.push_back(allocation->generation);
                 key.push_back(reinterpret_cast<uintptr_t>(t->data)-reinterpret_cast<uintptr_t>(allocation->storage));
@@ -368,10 +369,23 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
             if(!reserve_cache(0)){throw partition_error("Graph cache limit");}
             const auto preparation_start = std::chrono::steady_clock::now();
             auto fresh=std::make_unique<prepared_run>();fresh->key=std::move(key);fresh->partition=std::make_unique<partition_data>();
-            fresh->graph=checked(graph_owner::create(checked(context_owner::create(runtime_)),"connected_partition"));
-            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,runtime_->config().enable_w4fp16);
+            std::shared_ptr<context_owner> graph_context;
+            if (runtime_->config().shared_context) {
+                if (!shared_context_) { shared_context_ = checked(context_owner::create(runtime_)); }
+                graph_context = shared_context_;
+            } else { graph_context = checked(context_owner::create(runtime_)); }
+            const auto graph_name = runtime_->config().shared_context ? "connected_partition_" + std::to_string(++next_graph_name_) : "connected_partition";
+            fresh->graph=checked(graph_owner::create(std::move(graph_context),graph_name));
+            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,runtime_->config().enable_w4fp16,runtime_->config().app_write_weights);
             builder.lower();
             if(!reserve_cache(fresh->static_bytes)){throw partition_error("Static partition payload exceeds cache limit");}
+            if (diagnostic_phase()) {
+                uint64_t retained_bytes = 0;
+                for (const auto & cached : cache_) { retained_bytes += cached->static_bytes; }
+                GGML_LOG_INFO("qairt: inventory partition phase=%s graph=%llu cache_entries=%zu cache_static_bytes=%llu candidate_static_bytes=%zu first=%s last=%s ggml=%zu qnn=%zu w4=%zu\n",
+                    diagnostic_phase(), (unsigned long long) fresh->graph->diagnostic_id(), cache_.size(), (unsigned long long) retained_bytes,
+                    fresh->static_bytes, ggml_get_name(nodes.front()), ggml_get_name(nodes.back()), nodes.size(), fresh->partition->qnn_nodes, fresh->partition->w4_matmuls);
+            }
             const auto finalization_start = std::chrono::steady_clock::now();
             const auto finalized = fresh->graph->finalize();
             const auto preparation_end = std::chrono::steady_clock::now();

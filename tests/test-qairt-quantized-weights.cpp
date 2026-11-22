@@ -25,8 +25,9 @@ struct options {
     const char * scales = "mixed";
     const char * model = nullptr;
     const char * weight_name = "blk.27.attn_q.weight";
+    ggml_type weight_type = GGML_TYPE_Q4_0;
     uint32_t k = 128, n = 32, m = 13, runs = 7;
-    bool sign_extend = false;
+    bool sign_extend = false, dynamic_fp16 = false, fp16_only = false;
     bool transpose = true, one_hot = false, float_offset = false, signed_scales = false, trace_values = false, unsigned_carrier = false, dynamic_weights = false, tensor_v1 = false;
 };
 struct quantized_weights {
@@ -52,6 +53,13 @@ static std::vector<uint8_t> source_weights(const options & o) {
 }
 static quantized_weights repack(const std::vector<uint8_t> & raw, const options & o) {
     quantized_weights output;
+    if (o.weight_type == GGML_TYPE_Q4_1) {
+        auto result = prepare_w4_weights({raw.data(),raw.size()},o.k,o.n,o.weight_type);
+        CHECK(result.ok()); if (!result.ok()) { return output; }
+        output.data.assign(result.value().codes.begin(),result.value().codes.end());
+        output.scales = result.value().quantization->scales;
+        return output;
+    }
     const size_t count = size_t(o.k) * o.n;
     const bool packed = is_packed(o), transposed = is_transposed(o), bw8 = std::strcmp(o.encoding, "bw8") == 0;
     output.data.resize(packed ? count / 2 : count);
@@ -89,7 +97,7 @@ static void packing_tests() {
                             const auto raw = source_weights(o);
                             const auto original = raw;
                             const auto packed = repack(raw, o);
-                            auto reference = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n);
+                            auto reference = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n, o.weight_type);
                             CHECK(reference.ok()); if (!reference.ok()) { return; }
                             for (size_t i = 0; i < size_t(o.k) * o.n; ++i) {
                                 const size_t index = transpose ? i : (i % o.k) * o.n + i / o.k;
@@ -168,12 +176,12 @@ static run_result execute(const options & o, const std::vector<uint16_t> & input
     quantized_weights packed;
     if (quantized) { packed = repack(raw, o); }
     else {
-        auto reference = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n);
+        auto reference = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n, o.weight_type);
         CHECK(reference.ok()); if (!reference.ok()) { cleanup(); r.stage = "reference"; r.code = QNN_COMMON_ERROR_GENERAL; return r; }
         fp16.resize(size_t(o.k) * o.n);
         for (size_t i = 0; i < fp16.size(); ++i) { fp16[is_transposed(o) ? i : (i % o.k) * o.n + i / o.k] = reference.value()[i].bits; }
     }
-    auto w = tensor("w", quantized && o.dynamic_weights ? QNN_TENSOR_TYPE_APP_WRITE : QNN_TENSOR_TYPE_STATIC, quantized ? (o.unsigned_carrier ? (is_packed(o) ? QNN_DATATYPE_UFIXED_POINT_4 : QNN_DATATYPE_UFIXED_POINT_8) : (is_packed(o) ? QNN_DATATYPE_SFIXED_POINT_4 : QNN_DATATYPE_SFIXED_POINT_8)) : QNN_DATATYPE_FLOAT_16,
+    auto w = tensor("w", (quantized ? o.dynamic_weights : o.dynamic_fp16) ? QNN_TENSOR_TYPE_APP_WRITE : QNN_TENSOR_TYPE_STATIC, quantized ? (o.unsigned_carrier ? (is_packed(o) ? QNN_DATATYPE_UFIXED_POINT_4 : QNN_DATATYPE_UFIXED_POINT_8) : (is_packed(o) ? QNN_DATATYPE_SFIXED_POINT_4 : QNN_DATATYPE_SFIXED_POINT_8)) : QNN_DATATYPE_FLOAT_16,
                     wd, quantized ? (void *)packed.data.data() : (void *)fp16.data(), quantized ? packed.data.size() : fp16.size() * 2);
     if (quantized) {
         w.v2.quantizeParams.encodingDefinition = QNN_DEFINITION_DEFINED;
@@ -185,7 +193,7 @@ static run_result execute(const options & o, const std::vector<uint16_t> & input
             w.v2.quantizeParams.bwFloatBlockEncoding = {std::strcmp(o.encoding, "bw8") == 0 ? 8u : 4u, block.data(), packed.scales.data()};
         }
     }
-    if (quantized && o.dynamic_weights) { w.v2.clientBuf = {nullptr, 0}; }
+    if (quantized ? o.dynamic_weights : o.dynamic_fp16) { w.v2.clientBuf = {nullptr, 0}; }
     const auto original_scales = packed.scales;
     for (auto * t : {&x, &w, &y}) {
         if (o.tensor_v1) { const auto v2 = t->v2; t->version = QNN_TENSOR_VERSION_1; t->v1.id = v2.id; t->v1.name = v2.name; t->v1.type = v2.type; t->v1.dataFormat = v2.dataFormat; t->v1.dataType = v2.dataType; t->v1.quantizeParams = v2.quantizeParams; t->v1.rank = v2.rank; t->v1.dimensions = v2.dimensions; t->v1.memType = v2.memType; t->v1.clientBuf = v2.clientBuf; }
@@ -232,7 +240,7 @@ static run_result execute(const options & o, const std::vector<uint16_t> & input
     bind(x, const_cast<uint16_t *>(input.data()), input.size() * 2);
     bind(y, r.output.data(), r.output.size() * 2);
     std::vector<Qnn_Tensor_t> execution_inputs = {x};
-    if (quantized && o.dynamic_weights) { bind(w, packed.data.data(), packed.data.size()); execution_inputs.push_back(w); }
+    if (quantized ? o.dynamic_weights : o.dynamic_fp16) { bind(w, quantized ? (void *)packed.data.data() : (void *)fp16.data(), quantized ? packed.data.size() : fp16.size()*2); execution_inputs.push_back(w); }
     std::vector<double> timings;
     for (uint32_t i = 0; i <= o.runs; ++i) {
         start = timer::now();
@@ -251,6 +259,8 @@ int main(int argc, char ** argv) {
         if (std::strcmp(argv[i], "--one-hot") == 0) { o.one_hot = true; continue; }
         if (std::strcmp(argv[i], "--sign-extend") == 0) { o.sign_extend = true; continue; }
         if (std::strcmp(argv[i], "--unsigned") == 0) { o.unsigned_carrier = true; continue; }
+        if (std::strcmp(argv[i], "--fp16-only") == 0) { o.fp16_only = true; continue; }
+        if (std::strcmp(argv[i], "--dynamic-fp16") == 0) { o.dynamic_fp16 = true; continue; }
         if (std::strcmp(argv[i], "--dynamic-weights") == 0) { o.dynamic_weights = true; continue; }
         if (std::strcmp(argv[i], "--tensor-v1") == 0) { o.tensor_v1 = true; continue; }
         if (std::strcmp(argv[i], "--signed-scales") == 0) { o.signed_scales = true; continue; }
@@ -281,34 +291,40 @@ int main(int argc, char ** argv) {
         if (!model) { return 2; }
         ggml_tensor * weight = nullptr;
         for (const auto & entry : model->tensors_by_name) { if (entry.first == o.weight_name) { weight = entry.second; break; } }
-        if (!weight || weight->type != GGML_TYPE_Q4_0 || weight->ne[2] != 1 || weight->ne[3] != 1 || !ggml_is_contiguous(weight) || weight->ne[0] <= 0 || weight->ne[0] > 8192 || weight->ne[1] <= 0 || weight->ne[1] > 8192 || weight->ne[0] * weight->ne[1] > 32 * 1024 * 1024) {
-            std::fprintf(stderr, "Model tensor must be a contiguous Q4_0 matrix: %s\n", o.weight_name); return 2;
+        if (!weight || (weight->type != GGML_TYPE_Q4_0 && weight->type != GGML_TYPE_Q4_1) || weight->ne[2] != 1 || weight->ne[3] != 1 || !ggml_is_contiguous(weight) || weight->ne[0] <= 0 || weight->ne[0] > 8192 || weight->ne[1] <= 0 || weight->ne[1] > 8192 || weight->ne[0] * weight->ne[1] > 32 * 1024 * 1024) {
+            std::fprintf(stderr, "Model tensor must be a contiguous Q4_0/Q4_1 matrix: %s\n", o.weight_name); return 2;
         }
+        o.weight_type = weight->type;
         o.k = uint32_t(weight->ne[0]); o.n = uint32_t(weight->ne[1]);
         raw.resize(ggml_nbytes(weight)); ggml_backend_tensor_get(weight, raw.data(), 0, raw.size());
-        std::printf("MODEL tensor=%s K=%u N=%u type=Q4_0\n", o.weight_name, o.k, o.n);
+        std::printf("MODEL tensor=%s K=%u N=%u type=%s\n", o.weight_name, o.k, o.n, ggml_type_name(o.weight_type));
     }
     if ((std::strcmp(o.op, "matmul") && std::strcmp(o.op, "fc") && std::strcmp(o.op, "conv")) ||
         (std::strcmp(o.encoding, "bw4") && std::strcmp(o.encoding, "bw8") && std::strcmp(o.encoding, "packed4") && std::strcmp(o.encoding, "packed-float4")) ||
         (std::strcmp(o.scales, "positive") && std::strcmp(o.scales, "negative") && std::strcmp(o.scales, "mixed") && std::strcmp(o.scales, "zero")) ||
         !o.k || o.k % 32 || !o.n || !o.m || !o.runs || o.runs > 100 || o.k > 8192 || o.n > 8192 || o.m > 8192 || size_t(o.k) * o.n > 32 * 1024 * 1024) { return 2; }
+    if (o.weight_type == GGML_TYPE_Q4_1 && (std::strcmp(o.encoding,"bw4") || !is_transposed(o) ||
+        o.unsigned_carrier || o.signed_scales || o.float_offset || o.dynamic_weights)) {
+        std::fprintf(stderr,"Q4_1 requires STATIC signed BW4 with transposed weights\n"); return 2;
+    }
     if (o.one_hot) { o.m = o.k; }
     std::printf("CASE op=%s encoding=%s scales=%s offset=%s K=%u N=%u M=%u transpose=%d\n", o.op, o.encoding, o.scales, o.float_offset ? "float" : "integer", o.k, o.n, o.m, is_transposed(o));
     auto start = timer::now(); if (raw.empty()) { raw = source_weights(o); } const auto original = raw;
     size_t positive = 0, negative = 0, zero = 0;
-    for (size_t b = 0; b < raw.size() / 18; ++b) { ggml_fp16_t half; std::memcpy(&half, raw.data() + b * 18, 2); const float d = ggml_fp16_to_fp32(half); positive += d > 0; negative += d < 0; zero += d == 0; }
+    for (size_t b = 0; b < raw.size() / ggml_type_size(o.weight_type); ++b) { ggml_fp16_t half; std::memcpy(&half, raw.data() + b * ggml_type_size(o.weight_type), 2); const float d = ggml_fp16_to_fp32(half); positive += d > 0; negative += d < 0; zero += d == 0; }
     std::printf("SCALES positive=%zu negative=%zu zero=%zu signed_scales=%d unsigned=%d dynamic=%d tensor_version=%u sign_extend=%d\n", positive, negative, zero, o.signed_scales, o.unsigned_carrier, o.dynamic_weights, o.tensor_v1 ? 1 : 2, o.sign_extend);
     start = timer::now(); const auto packed = repack(raw, o); const double repack_ms = elapsed(start);
-    start = timer::now(); auto weights = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n); const double decode_ms = elapsed(start);
+    start = timer::now(); auto weights = prepare_q4_weights({raw.data(), raw.size()}, o.k, o.n, o.weight_type); const double decode_ms = elapsed(start);
     CHECK(weights.ok()); if (!weights.ok()) { return 1; }
     std::printf("PAYLOAD source_bytes=%zu qnn_weight_bytes=%zu scale_offset_bytes=%zu fp16_bytes=%zu repack_ms=%.6f decode_ms=%.6f\n", raw.size(), packed.data.size(), packed.scales.size() * sizeof(Qnn_FloatScaleOffset_t), weights.value().size() * 2, repack_ms, decode_ms);
     std::vector<uint16_t> input(size_t(o.k) * o.m);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = ggml_fp32_to_fp16(o.one_hot ? (i / o.k == i % o.k ? 1.0f : 0.0f) : 0.25f * std::sin(float(i % 4001) * 0.043f)); }
-    const auto baseline = execute(o, input, raw, false);
+    auto baseline_options = o; baseline_options.dynamic_fp16 = false;
+    const auto baseline = execute(baseline_options, input, raw, false);
     std::printf("BASELINE stage=%s code=%llu prepare_ms=%.6f execute_ms=%.6f\n", baseline.stage, (unsigned long long)baseline.code, baseline.prepare_ms, baseline.execute_ms);
     if (baseline.code != QNN_SUCCESS) { return 2; }
-    const auto candidate = execute(o, input, raw, true);
-    std::printf("QUANTIZED stage=%s code=%llu prepare_ms=%.6f execute_ms=%.6f\n", candidate.stage, (unsigned long long)candidate.code, candidate.prepare_ms, candidate.execute_ms);
+    const auto candidate = execute(o, input, raw, !o.fp16_only);
+    std::printf("CANDIDATE quantized=%d dynamic=%d stage=%s code=%llu prepare_ms=%.6f execute_ms=%.6f\n", !o.fp16_only, o.fp16_only ? o.dynamic_fp16 : o.dynamic_weights, candidate.stage, (unsigned long long)candidate.code, candidate.prepare_ms, candidate.execute_ms);
     CHECK(raw == original);
     if (candidate.code != QNN_SUCCESS) { return 2; }
     double error = 0, energy = 0, maximum = 0;

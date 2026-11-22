@@ -41,7 +41,7 @@ result<std::vector<uint8_t>> materialize(const ggml_tensor * t, enum ggml_type t
         }
     }
     std::vector<uint8_t> packed(count * target_element);
-    if (t->type == GGML_TYPE_Q4_0) {
+    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_1) {
         const auto * traits = ggml_get_type_traits(t->type);
         if (!traits->to_float || type != GGML_TYPE_F16) { return bytes_result::failure(conversion_error("Unsupported quantized conversion")); }
         std::vector<float> row(size_t(t->ne[0]));
@@ -140,6 +140,8 @@ bool backend_context::reserve_cache(size_t additional, const prepared_run * keep
     uint64_t retained = 0;
     for (const auto & entry : cache_) { retained += entry->static_bytes; }
     while ((!keep && cache_.size() >= cache_limit) || retained > static_cache_limit - additional) {
+        // QNN graph resources live until contextFree; individual eviction cannot reclaim them.
+        if (runtime_->config().shared_context) { return false; }
         auto victim = std::find_if(cache_.begin(), cache_.end(), [keep](const auto & entry) { return entry.get() != keep; });
         if (victim == cache_.end()) { return false; }
         retained -= (*victim)->static_bytes; cache_.erase(victim);
@@ -150,9 +152,23 @@ bool backend_context::reserve_cache(size_t additional, const prepared_run * keep
 enum ggml_status backend_context::compute(ggml_cgraph * graph) {
     auto fail = [&](const qairt_error & e) {
         GGML_LOG_ERROR("qairt: %s: %s (QNN error %llu)\n", e.operation.c_str(), e.message.c_str(), (unsigned long long)e.qnn_error.value_or(0));
-        cache_.clear();
+        invalidate();
         return GGML_STATUS_FAILED;
     };
+    struct log_scope {
+        runtime_owner & runtime;
+        QnnLog_Level_t previous;
+        bool changed = false;
+        ~log_scope() {
+            if (changed && !runtime.set_log_level(previous).ok()) { GGML_LOG_ERROR("qairt: failed to restore QNN log level\n"); }
+        }
+    } scope {*runtime_, runtime_->log_level()};
+    const char * phase = diagnostic_phase();
+    if (phase && std::strcmp(phase, "decode0") == 0) {
+        const auto changed = runtime_->set_log_level(QNN_LOG_LEVEL_DEBUG);
+        if (!changed.ok()) { return fail(changed.error()); }
+        scope.changed = true;
+    }
     if (!graph || ggml_graph_n_nodes(graph) > 128) { return fail(conversion_error("Partition exceeds M2 node limit")); }
     const int count = ggml_graph_n_nodes(graph);
     auto ** nodes = ggml_graph_nodes(graph);

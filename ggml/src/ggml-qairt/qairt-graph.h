@@ -62,6 +62,7 @@ public:
     status close();
     const tensor_record * find_tensor(tensor_id id) const noexcept;
     graph_state state() const noexcept { return state_; }
+    uint64_t diagnostic_id() const noexcept { return diagnostic_id_; }
     std::shared_ptr<context_owner> context() const noexcept { return context_; }
 private:
     friend class execution_binding;
@@ -75,6 +76,7 @@ private:
     std::vector<tensor_id> output_ids_;
     mutable uint32_t active_bindings_ = 0;
     bool node_added_ = false;
+    uint64_t diagnostic_id_ = 0;
     std::vector<tensor_id> produced_ids_;
 };
 

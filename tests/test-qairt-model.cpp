@@ -8,6 +8,7 @@
 #include "qairt-fp16-reference.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,8 +23,16 @@ using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
 using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
+static std::atomic<bool> qnn_log_phase {false};
+static bool set_probe_phase(const char * phase) {
+#ifdef _WIN32
+    return _putenv_s("GGML_QAIRT_DIAGNOSTIC_PHASE", phase ? phase : "") == 0;
+#else
+    return phase ? setenv("GGML_QAIRT_DIAGNOSTIC_PHASE", phase, 1) == 0 : unsetenv("GGML_QAIRT_DIAGNOSTIC_PHASE") == 0;
+#endif
+}
 static void logger(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
+    if ((qnn_log_phase.load() && std::strstr(text, "qairt:")) || std::strstr(text, "qairt: inventory") || level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
 }
 struct observation;
 static bool observe(ggml_tensor *, bool, void *);
@@ -72,7 +81,7 @@ private:
         if (t->op == GGML_OP_NONE) { return true; }
         if (!active_->all_) {
             return t->op==GGML_OP_RESHAPE || t->op==GGML_OP_VIEW || t->op==GGML_OP_TRANSPOSE || t->op==GGML_OP_PERMUTE ||
-                   t->op==GGML_OP_CONT || t->op==GGML_OP_DUP || t->op==GGML_OP_CPY || (t->op==GGML_OP_MUL_MAT && t->src[0]->type==GGML_TYPE_Q4_0);
+                   t->op==GGML_OP_CONT || t->op==GGML_OP_DUP || t->op==GGML_OP_CPY || (t->op==GGML_OP_MUL_MAT && (t->src[0]->type==GGML_TYPE_Q4_0 || t->src[0]->type==GGML_TYPE_Q4_1));
         }
         return selected(t);
     }
@@ -106,7 +115,7 @@ private:
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto * t = ggml_graph_node(graph, i);
                 if (active_->fused_observation) { observe_backend(t, active_->fused_observation); }
-                if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_Q4_0) { ++active_->projections[ggml_get_name(t->src[0])]; }
+                if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_Q4_0 || t->src[0]->type == GGML_TYPE_Q4_1)) { ++active_->projections[ggml_get_name(t->src[0])]; }
                 else if (t->op != GGML_OP_NONE && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_CONT && t->op != GGML_OP_DUP && t->op != GGML_OP_CPY) { ++active_->others; }
                 if (t->op != GGML_OP_NONE && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_PERMUTE) {
                     ++active_->operations[std::string(ggml_op_name(t->op)) + " " + ggml_get_name(t)];
@@ -212,7 +221,7 @@ static bool observe(ggml_tensor * tensor, bool ask, void * user) {
         const auto ending = "-" + std::to_string(layer);
         selected |= name.size() >= ending.size() && name.compare(name.size() - ending.size(), ending.size(), ending) == 0;
     }
-    const bool projection = tensor->op == GGML_OP_MUL_MAT && tensor->src[0]->type == GGML_TYPE_Q4_0;
+    const bool projection = tensor->op == GGML_OP_MUL_MAT && (tensor->src[0]->type == GGML_TYPE_Q4_0 || tensor->src[0]->type == GGML_TYPE_Q4_1);
     const std::string weight_prefix = "blk." + std::to_string(seen.layer) + ".";
     bool selected_projection = false;
     if (projection) { for (int layer = seen.first; layer <= seen.layer; ++layer) {
@@ -329,12 +338,13 @@ static void compare_activation_edges(const observation & cpu, const observation 
                     label, item.first.c_str(), input.nmse, packed.nmse, changed);
     }
 }
-struct options { bool control = false, all = true, fused = false, fp16 = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt; };
+struct options { bool control = false, all = true, fused = false, fp16 = false, prepare_probe = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt; };
 static bool parse(int argc, char ** argv, options & options) {
     try {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--fp16-reference") { options.fp16 = true; continue; }
+            if (arg == "--qnn-prepare-probe") { options.prepare_probe = true; continue; }
             if (arg == "--fused") { options.fused = true; continue; }
             if (arg == "--cpu-control") { options.control = true; continue; }
             if (i + 1 >= argc) { return false; }
@@ -407,9 +417,10 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--fp16-reference-self-test") == 0) { return fp16_reference_self_test(); }
     options opt;
     if (argc < 2 || !parse(argc, argv, opt)) {
-        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024]\n");
+        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--qnn-prepare-probe] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024]\n");
         return 2;
     }
+    if (opt.prepare_probe) { CHECK(set_probe_phase("init")); }
     llama_log_set(logger, nullptr); ggml_log_set(logger, nullptr); ggml_backend_load_all(); llama_backend_init();
     ggml_backend_dev_t cpu_devices[] = {nullptr};
     auto mp = llama_model_default_params(); mp.devices = cpu_devices; mp.n_gpu_layers = 0;
@@ -434,18 +445,8 @@ int main(int argc, char ** argv) {
             patterns.push_back("^blk\\." + std::to_string(layer) + "\\." + name + "\\.weight$");
         } }
     }
-    std::vector<std::string> cpu_patterns;
-    // Explicit overrides must preserve CPU fallback for unsupported Q4_1 projections.
-    // W4 QAIRT buffers are backend-managed and cannot serve as CPU-owned weight buffers.
-    for (const auto & item : reference->tensors_by_name) {
-        if (item.second->type != GGML_TYPE_Q4_1) { continue; }
-        std::string pattern = "^";
-        for (const char ch : item.first) { if (ch == '.') { pattern += '\\'; } pattern += ch; }
-        pattern += '$'; cpu_patterns.push_back(std::move(pattern));
-    }
     std::vector<llama_model_tensor_buft_override> overrides;
     if (htp) {
-        for (const auto & pattern : cpu_patterns) { overrides.push_back({pattern.c_str(), ggml_backend_cpu_buffer_type()}); }
         for (const auto & pattern : patterns) { overrides.push_back({pattern.c_str(), ggml_backend_dev_buffer_type(htp)}); }
     }
     overrides.push_back({nullptr, nullptr});
@@ -485,21 +486,31 @@ int main(int argc, char ** argv) {
         if (executed) { executed->clear(); }
         const size_t reference_before = fp16 ? fp16->nodes : 0;
         const int cpu_status = decode(cpu_ctx.get(), input, position);
-        int cpu_projections = 0;
+        int q41_projections = 0;
         for (const auto & projection : cpu_seen.projection_types) {
             CHECK(projection.second == GGML_TYPE_Q4_0 || projection.second == GGML_TYPE_Q4_1);
-            cpu_projections += projection.second == GGML_TYPE_Q4_1;
+            q41_projections += projection.second == GGML_TYPE_Q4_1;
         }
         CHECK(cpu_seen.projection_types.size() == size_t(7 * opt.layers));
-        const int htp_projections = 7 * opt.layers - cpu_projections;
+        const int htp_projections = 7 * opt.layers;
         if (std::strcmp(label, "prefill") == 0) {
-            std::printf("Projection inventory: Q4_0=%d Q4_1_CPU=%d\n", htp_projections, cpu_projections);
+            std::printf("Projection inventory: Q4_0=%d Q4_1=%d all_HTP=%d\n", htp_projections-q41_projections, q41_projections, htp_projections);
             for (const auto & projection : cpu_seen.projection_types) {
-                if (projection.second == GGML_TYPE_Q4_1) { std::printf("CPU projection fallback: %s type=Q4_1\n", projection.first.c_str()); }
+                if (projection.second == GGML_TYPE_Q4_1) { std::printf("HTP projection: %s type=Q4_1\n", projection.first.c_str()); }
             }
         }
         if (executed) { CHECK(executed->projections.empty() && executed->others == 0); }
+        if (opt.prepare_probe) {
+            CHECK(set_probe_phase(label));
+            qnn_log_phase.store(std::strcmp(label, "decode0") == 0);
+            std::fprintf(stderr, "qairt: inventory phase_begin phase=%s\n", label);
+        }
         const int actual_status = decode(actual_ctx.get(), input, position);
+        if (opt.prepare_probe) {
+            std::fprintf(stderr, "qairt: inventory phase_end phase=%s status=%d\n", label, actual_status);
+            qnn_log_phase.store(false);
+            CHECK(set_probe_phase("idle"));
+        }
         if (executed) {
             actual_seen.htp_projections = 0; actual_seen.other_htp = executed->others;
             for (const auto & projection : executed->projections) {
@@ -512,7 +523,7 @@ int main(int argc, char ** argv) {
         if (fp16) {
             const size_t nodes = fp16->nodes - reference_before;
             std::printf("%s FP16 reference emulated_nodes=%zu cached_weights=%zu scope=blocks%d-%d+final_norm\n", label, nodes, fp16->reference().cached_weights(), first, last);
-            CHECK(nodes == size_t((26 * opt.layers + 4 - cpu_projections) * (opt.control ? 2 : 1)));
+            CHECK(nodes == size_t((26 * opt.layers + 4) * (opt.control ? 2 : 1)));
         }
         CHECK(cpu_status == 0 && actual_status == 0);
         if (cpu_status || actual_status) {
@@ -555,14 +566,14 @@ int main(int argc, char ** argv) {
             for (const auto & op : executed->operations) {
                 by_operation[op.first.substr(0, op.first.find(' '))] += op.second;
             }
-            CHECK(by_operation["MUL_MAT"] == 9 * opt.layers - cpu_projections);
+            CHECK(by_operation["MUL_MAT"] == 9 * opt.layers);
             CHECK(by_operation["RMS_NORM"] == 4 * opt.layers + 1 && by_operation["MUL"] == 4 * opt.layers + 1);
             CHECK(by_operation["ROPE"] == 2 * opt.layers && by_operation["SOFT_MAX"] == opt.layers);
             CHECK(by_operation["GLU"] == opt.layers && by_operation["ADD"] == 2 * opt.layers);
             CHECK(by_operation["SET_ROWS"] == 2 * opt.layers && by_operation["GET_ROWS"] == 2);
         }
         if (executed) {
-            if (opt.fused && opt.all) { CHECK(executed->graph_counts.executions == uint64_t(opt.layers + cpu_projections)); }
+            if (opt.fused && opt.all) { CHECK(executed->graph_counts.executions == uint64_t(opt.layers)); }
             std::printf("%s QNN graphs created=%llu cache_hits=%llu executions=%llu\n", label,
                         (unsigned long long) executed->graph_counts.preparations,
                         (unsigned long long) executed->graph_counts.cache_hits,
@@ -605,6 +616,11 @@ int main(int argc, char ** argv) {
         const std::string label = "decode" + std::to_string(step);
         next = frame({next}, label.c_str(), true);
         if (decode_failed) { return 1; }
+        if (opt.prepare_probe) {
+            std::printf("QNN preparation probe: prefill_status=0 decode_status=0 decode_steps=1 failures=%d\n", failures);
+            std::fflush(stdout);
+            return failures ? 1 : 0;
+        }
     }
     CHECK(disagreements <= 1);
     std::printf("teacher-forced response: %s\n", response.c_str());

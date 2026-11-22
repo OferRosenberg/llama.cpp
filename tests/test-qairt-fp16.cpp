@@ -23,7 +23,7 @@ static int failures = 0, checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
 static context_ptr context() { return {ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free}; }
 static void logger(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_ERROR) { std::fputs(text, stderr); }
+    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "qairt: inventory")) { std::fputs(text, stderr); }
 }
 static void packing_tests() {
     std::vector<uint8_t> raw(18 * 2);
@@ -86,6 +86,40 @@ static void w4_packing_tests() {
     const auto nan = ggml_fp32_to_fp16(std::numeric_limits<float>::quiet_NaN()); std::memcpy(raw.data(),&nan,2);
     CHECK(!upload.update({raw.data(),raw.size()},32,2,0,2).ok() && !upload.get(32,2));
     CHECK(original[0] != raw[0] || original[1] != raw[1]);
+}
+
+static void q41_packing_tests() {
+    std::vector<uint8_t> raw(20 * 4);
+    for (size_t b = 0; b < 4; ++b) {
+        const auto d = ggml_fp32_to_fp16(b == 2 ? 0.0f : b == 3 ? -0.25f : 0.25f);
+        const auto m = ggml_fp32_to_fp16(b == 2 ? 1.125f : -1.9375f);
+        std::memcpy(raw.data() + 20 * b, &d, 2); std::memcpy(raw.data() + 20 * b + 2, &m, 2);
+        for (size_t j = 0; j < 16; ++j) { raw[20 * b + 4 + j] = uint8_t(j | ((15 - j) << 4)); }
+    }
+    const auto original = raw;
+    auto packed = prepare_w4_weights({raw.data(),raw.size()},32,4,GGML_TYPE_Q4_1);
+    auto ref = prepare_q4_weights({raw.data(),raw.size()},32,4,GGML_TYPE_Q4_1);
+    CHECK(packed.ok() && ref.ok());
+    if (packed.ok() && ref.ok()) {
+        CHECK(packed.value().quantization->scales[0].offset == 0.25f);
+        for (size_t i = 0; i < 128; ++i) {
+            const auto q = packed.value().quantization->scales[i / 32];
+            CHECK(ggml_fp32_to_fp16((packed.value().codes[i] + q.offset) * q.scale) == ref.value()[i].bits);
+        }
+    }
+    w4_weight_upload upload;
+    CHECK(upload.update({raw.data(),raw.size()},32,4,40,40,GGML_TYPE_Q4_1).ok());
+    CHECK(!upload.get(32,4,GGML_TYPE_Q4_1));
+    CHECK(upload.update({raw.data(),raw.size()},32,4,0,40,GGML_TYPE_Q4_1).ok());
+    CHECK(upload.get(32,4,GGML_TYPE_Q4_1) && !upload.get(32,4,GGML_TYPE_Q4_0));
+    CHECK(raw == original);
+    CHECK(!prepare_w4_weights({raw.data(),raw.size()-1},32,4,GGML_TYPE_Q4_1).ok());
+    CHECK(!prepare_w4_weights({raw.data(),raw.size()},32,4,GGML_TYPE_Q8_0).ok());
+    const auto nan = ggml_fp32_to_fp16(std::numeric_limits<float>::quiet_NaN());
+    std::memcpy(raw.data()+2,&nan,2);
+    CHECK(!prepare_w4_weights({raw.data(),raw.size()},32,4,GGML_TYPE_Q4_1).ok());
+    const auto huge = ggml_fp32_to_fp16(65504.0f); std::memcpy(raw.data()+2,&huge,2);
+    CHECK(!prepare_w4_weights({raw.data(),raw.size()},32,4,GGML_TYPE_Q4_1).ok());
 }
 
 static std::vector<float> cpu_product(ggml_backend_t cpu, ggml_tensor * weights, ggml_tensor * input) {
@@ -201,12 +235,12 @@ static void fp16_activation_test(ggml_backend_dev_t device) {
     std::printf("direct FP16 activation actual=%.9g expected=%.9g\n", actual, expected);
     CHECK(std::fabs(actual - expected) <= 0.001f);
 }
-static void w4_backend_test(ggml_backend_dev_t device) {
+static void w4_backend_test(ggml_backend_dev_t device, ggml_type type = GGML_TYPE_Q4_0) {
     CHECK(std::strstr(ggml_backend_dev_description(device),"W4FP16") != nullptr);
     backend_ptr backend(ggml_backend_dev_init(device,nullptr),ggml_backend_free);
     CHECK(backend); if (!backend) { return; }
     auto wc = context(), c = context();
-    auto * w = ggml_new_tensor_2d(wc.get(),GGML_TYPE_Q4_0,32,16);
+    auto * w = ggml_new_tensor_2d(wc.get(),type,32,16);
     buffer_ptr wb(ggml_backend_alloc_ctx_tensors(wc.get(),backend.get()),ggml_backend_buffer_free);
     CHECK(wb); if (!wb) { return; }
     // Host buffers bypass tensor upload callbacks in the non-mmap model loader.
@@ -214,9 +248,15 @@ static void w4_backend_test(ggml_backend_dev_t device) {
     CHECK(ggml_backend_supports_buft(backend.get(),ggml_backend_dev_buffer_type(device)));
     ggml_backend_buffer_set_usage(wb.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<uint8_t> raw(ggml_nbytes(w));
+    const size_t block_bytes = ggml_type_size(type);
     for (size_t row = 0; row < 16; ++row) {
-        const auto d = ggml_fp32_to_fp16(row%2 ? -0.25f : 0.25f); std::memcpy(raw.data()+row*18,&d,2);
-        for (size_t j = 0; j < 16; ++j) { raw[row*18+2+j] = uint8_t(j | ((15-j)<<4)); }
+        const auto d = ggml_fp32_to_fp16(row%2 ? -0.25f : 0.25f); std::memcpy(raw.data()+row*block_bytes,&d,2);
+        if (type == GGML_TYPE_Q4_1) {
+            const auto m = ggml_fp32_to_fp16(row == 2 ? 1.125f : -1.9375f);
+            std::memcpy(raw.data()+row*block_bytes+2,&m,2);
+            if (row == 2) { const auto zero = ggml_fp32_to_fp16(0); std::memcpy(raw.data()+row*block_bytes,&zero,2); }
+        }
+        for (size_t j = 0; j < 16; ++j) { raw[row*block_bytes+(type == GGML_TYPE_Q4_1 ? 4 : 2)+j] = uint8_t(j | ((15-j)<<4)); }
     }
     ggml_backend_tensor_set(w,raw.data()+raw.size()/2,raw.size()/2,raw.size()/2);
     ggml_backend_tensor_set(w,raw.data(),0,raw.size()/2);
@@ -236,7 +276,7 @@ static void w4_backend_test(ggml_backend_dev_t device) {
     for (int run = 0; run < 2; ++run) {
         CHECK(ggml_backend_graph_compute(backend.get(),graph) == GGML_STATUS_SUCCESS);
         std::vector<float> actual(16*32), expected(actual.size()); ggml_backend_tensor_get(y,actual.data(),0,actual.size()*4);
-        auto reference = prepare_q4_weights({raw.data(),raw.size()},32,16); CHECK(reference.ok());
+        auto reference = prepare_q4_weights({raw.data(),raw.size()},32,16,type); CHECK(reference.ok());
         if (reference.ok()) { for (size_t row = 0; row < 16; ++row) { for (size_t j = 0; j < 32; ++j) { expected[j*16+row] = ggml_fp16_to_fp32(reference.value()[row*32+j].bits); } } accuracy(actual,expected,"W4FP16 identity"); }
     }
     ggml_backend_qairt_stats stats {}; CHECK(fn(backend.get(),&stats));
@@ -245,7 +285,7 @@ static void w4_backend_test(ggml_backend_dev_t device) {
     ggml_backend_tensor_set(x2,selected.data(),0,selected.size()*4);
     CHECK(ggml_backend_graph_compute(backend.get(),graph2) == GGML_STATUS_SUCCESS);
     std::vector<float> second(16); ggml_backend_tensor_get(y2,second.data(),0,second.size()*4);
-    auto reference2 = prepare_q4_weights({raw.data(),raw.size()},32,16); CHECK(reference2.ok());
+    auto reference2 = prepare_q4_weights({raw.data(),raw.size()},32,16,type); CHECK(reference2.ok());
     std::vector<float> expected2(16);
     if (reference2.ok()) { for (size_t row = 0; row < 16; ++row) { expected2[row] = ggml_fp16_to_fp32(reference2.value()[row*32].bits); } accuracy(second,expected2,"W4FP16 second profile"); }
     CHECK(fn(backend.get(),&stats) && stats.w4_preparations == 2 && stats.w4_executions == 3);
@@ -254,14 +294,68 @@ static void w4_backend_test(ggml_backend_dev_t device) {
     CHECK(ggml_backend_graph_compute(backend.get(),graph) == GGML_STATUS_SUCCESS);
     CHECK(fn(backend.get(),&stats) && stats.w4_preparations == 3 && stats.w4_executions == 4);
     std::vector<float> updated(16*32), expected_updated(updated.size()); ggml_backend_tensor_get(y,updated.data(),0,updated.size()*4);
-    auto reference_updated = prepare_q4_weights({raw.data(),raw.size()},32,16); CHECK(reference_updated.ok());
+    auto reference_updated = prepare_q4_weights({raw.data(),raw.size()},32,16,type); CHECK(reference_updated.ok());
     if (reference_updated.ok()) { for (size_t row = 0; row < 16; ++row) { for (size_t j = 0; j < 32; ++j) { expected_updated[j*16+row] = ggml_fp16_to_fp32(reference_updated.value()[row*32+j].bits); } } accuracy(updated,expected_updated,"W4FP16 mutated weight"); }
     std::vector<uint8_t> unchanged(raw.size()); ggml_backend_tensor_get(w,unchanged.data(),0,unchanged.size()); CHECK(raw == unchanged);
     std::printf("W4FP16 native preparations=%llu executions=%llu\n",(unsigned long long)stats.w4_preparations,(unsigned long long)stats.w4_executions);
 }
 
+static void weight_reuse_test(ggml_backend_dev_t device) {
+    backend_ptr backend(ggml_backend_dev_init(device,nullptr),ggml_backend_free);
+    CHECK(backend); if (!backend) { return; }
+    const auto config = config_parser::from_environment(); CHECK(config.ok());
+    if (!config.ok()) { return; }
+    CHECK(config.value().app_write_weights && !config.value().enable_w4fp16);
+    auto wc_a = context(), wc_b = context(), c = context();
+    auto * a = ggml_new_tensor_2d(wc_a.get(),GGML_TYPE_Q4_0,32,16);
+    auto * b = ggml_new_tensor_2d(wc_b.get(),GGML_TYPE_Q4_0,32,16);
+    buffer_ptr weights_a(ggml_backend_alloc_ctx_tensors(wc_a.get(),backend.get()),ggml_backend_buffer_free);
+    buffer_ptr weights_b(ggml_backend_alloc_ctx_tensors(wc_b.get(),backend.get()),ggml_backend_buffer_free);
+    CHECK(weights_a && weights_b); if (!weights_a || !weights_b) { return; }
+    ggml_backend_buffer_set_usage(weights_a.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(weights_b.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<uint8_t> raw_a(ggml_nbytes(a)), raw_b(ggml_nbytes(b));
+    for (size_t row=0;row<16;++row) {
+        const auto scale_a=ggml_fp32_to_fp16(0.25f),scale_b=ggml_fp32_to_fp16(-0.5f);
+        std::memcpy(raw_a.data()+18*row,&scale_a,2);std::memcpy(raw_b.data()+18*row,&scale_b,2);
+        for(size_t j=0;j<16;++j){raw_a[18*row+2+j]=uint8_t(j|((15-j)<<4));raw_b[18*row+2+j]=uint8_t((15-j)|(j<<4));}
+    }
+    ggml_backend_tensor_set(a,raw_a.data(),0,raw_a.size());ggml_backend_tensor_set(b,raw_b.data(),0,raw_b.size());
+    auto * x_a=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,2);
+    auto * x_b=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,2);
+    auto * y_a=ggml_mul_mat(c.get(),a,x_a);auto * y_b=ggml_mul_mat(c.get(),b,x_b);
+    auto * g_a=ggml_new_graph(c.get());ggml_graph_add_node(g_a,y_a);
+    auto * g_b=ggml_new_graph(c.get());ggml_graph_add_node(g_b,y_b);
+    buffer_ptr io(ggml_backend_alloc_ctx_tensors(c.get(),backend.get()),ggml_backend_buffer_free);
+    CHECK(io); if (!io) { return; }
+    std::vector<float> input(64);input[0]=1;input[33]=1;
+    ggml_backend_tensor_set(x_a,input.data(),0,input.size()*4);ggml_backend_tensor_set(x_b,input.data(),0,input.size()*4);
+    for(int run=0;run<4;++run) {
+        const bool use_b=run==1;
+        if(run==3){const auto scale=ggml_fp32_to_fp16(1.0f);std::memcpy(raw_a.data(),&scale,2);ggml_backend_tensor_set(a,raw_a.data(),0,2);}
+        CHECK(ggml_backend_graph_compute(backend.get(),use_b?g_b:g_a)==GGML_STATUS_SUCCESS);
+        const auto & raw=use_b?raw_b:raw_a;auto decoded=prepare_q4_weights({raw.data(),raw.size()},32,16);CHECK(decoded.ok());
+        if(!decoded.ok()){return;}
+        std::vector<float> actual(32),expected(32);ggml_backend_tensor_get(use_b?y_b:y_a,actual.data(),0,actual.size()*4);
+        for(size_t token=0;token<2;++token){for(size_t row=0;row<16;++row){expected[token*16+row]=ggml_fp16_to_fp32(decoded.value()[row*32+token].bits);}}
+        accuracy(actual,expected,use_b?"dynamic weight B":"dynamic weight A");
+    }
+    const auto fn=reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),"ggml_backend_qairt_get_stats"));
+    CHECK(fn);if(!fn){return;}
+    ggml_backend_qairt_stats stats {};CHECK(fn(backend.get(),&stats));
+    CHECK(stats.preparations==(config.value().share_weight_graphs?1:3));
+    CHECK(stats.cache_hits==(config.value().share_weight_graphs?3:1) && stats.executions==4);
+    std::printf("APP_WRITE A/B/A/mutation: preparations=%llu hits=%llu executions=%llu sharing=%d\n",(unsigned long long)stats.preparations,(unsigned long long)stats.cache_hits,(unsigned long long)stats.executions,config.value().share_weight_graphs);
+}
+
 int main(int argc, char ** argv) {
     ggml_log_set(logger, nullptr);
+    const char * app_write = std::getenv("GGML_QAIRT_APP_WRITE_WEIGHTS");
+    const std::string saved_app_write = app_write ? app_write : "";
+    const char * sharing = std::getenv("GGML_QAIRT_SHARE_WEIGHT_GRAPHS");
+    const std::string saved_sharing = sharing ? sharing : "";
+    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "0");
+    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", "0");
     const char * old_target = std::getenv("GGML_QAIRT_DEVICE");
     const std::string saved_target = old_target ? old_target : "";
     _putenv_s("GGML_QAIRT_DEVICE", "HTP");
@@ -276,20 +370,35 @@ int main(int argc, char ** argv) {
     const auto enabled = config_parser::from_environment(); CHECK(enabled.ok() && enabled.value().enable_w4fp16);
     _putenv_s("GGML_QAIRT_W4FP16", "0");
     const auto disabled = config_parser::from_environment(); CHECK(disabled.ok() && !disabled.value().enable_w4fp16);
+    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "1");
+    _putenv_s("GGML_QAIRT_W4FP16", "1"); CHECK(!config_parser::from_environment().ok());
+    _putenv_s("GGML_QAIRT_W4FP16", "0");
+    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", "1"); CHECK(config_parser::from_environment().ok());
+    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "0"); CHECK(!config_parser::from_environment().ok());
+    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", saved_app_write.c_str());
+    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", saved_sharing.c_str());
     _putenv_s("GGML_QAIRT_W4FP16", saved_flag.c_str());
     _wputenv_s(L"GGML_QAIRT_LIBRARY_DIR", saved_directory.c_str());
     _putenv_s("GGML_QAIRT_DEVICE", saved_target.c_str());
     ggml_backend_load_all();
+    auto q41_context = context();
+    CHECK(q4_weight_layout(ggml_new_tensor_2d(q41_context.get(), GGML_TYPE_Q4_1, 32, 2)));
     packing_tests();
     w4_packing_tests();
+    q41_packing_tests();
     if (argc == 2 && std::strcmp(argv[1], "--host") == 0) {
         std::printf("QAIRT FP16 host: %d checks, %d failures\n", checks, failures);
         return failures ? 1 : 0;
     }
     auto device = ggml_backend_dev_by_name("QAIRT0");
     CHECK(device != nullptr);
-    if (device && argc == 2 && std::strcmp(argv[1],"--w4fp16") == 0) {
-        w4_backend_test(device);
+    if (device && argc == 2 && std::strcmp(argv[1],"--weight-reuse") == 0) {
+        weight_reuse_test(device);
+        std::printf("QAIRT APP_WRITE: %d checks, %d failures\n",checks,failures);
+        return failures ? 1 : 0;
+    }
+    if (device && argc == 2 && (std::strcmp(argv[1],"--w4fp16") == 0 || std::strcmp(argv[1],"--q41") == 0)) {
+        w4_backend_test(device, std::strcmp(argv[1],"--q41") == 0 ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0);
         std::printf("QAIRT W4FP16: %d checks, %d failures\n",checks,failures);
         return failures ? 1 : 0;
     }

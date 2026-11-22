@@ -18,18 +18,18 @@ $env:PATH = $env:GGML_QAIRT_LIBRARY_DIR + ';' + $env:PATH
 
 ## Scope and tensor contract
 
-The native path applies to admitted `GGML_OP_MUL_MAT` projections with contiguous, two-dimensional Q4_0 weights owned by QAIRT WEIGHTS buffers. The current backend emits QNN MatMul; research support for FullyConnected or Conv2d does not add production lowering for those operations.
+The native path applies to admitted `GGML_OP_MUL_MAT` projections with contiguous, two-dimensional Q4_0 or Q4_1 weights owned by QAIRT WEIGHTS buffers. The current backend emits QNN MatMul; research support for FullyConnected or Conv2d does not add production lowering for those operations.
 
 | Tensor | QNN representation | Shape / metadata |
 |---|---|---|
 | Projection weights | STATIC `QNN_DATATYPE_SFIXED_POINT_8`, one signed code per byte | `[1,1,N,K]`; `BW_FLOAT_BLOCK`, bitwidth 4; blocks `[1,1,1,32]` |
-| Block metadata | FP32 scale and FP32 offset per 32 codes | Positive scale; canonical offset 0 or 1 |
+| Block metadata | FP32 scale and FP32 offset per 32 codes | Positive scale; finite floating offset (Q4_1 may be fractional) |
 | Activation | FP16 | Reshape to `[1,1,M,K]` |
 | MatMul output | FP16 | `[1,1,M,N]`, reshape to the GGML logical shape |
 | Other numerical operations and weights | Existing FP16 path | Unchanged admission rules |
 | Indices and control tensors | Existing SDK-required integer types | Unchanged narrowing and validation |
 
-`transpose_in0=false`, `transpose_in1=true`. The byte carrier stores four-bit values sign-extended to eight bits; it is not packed QNN SFIXED_POINT_4 and is not activation quantization. QNN handles its internal packing and expansion into FP16. Raw GGUF Q4_0 bytes cannot be passed directly to this public tensor contract.
+`transpose_in0=false`, `transpose_in1=true`. The byte carrier stores four-bit values sign-extended to eight bits; it is not packed QNN SFIXED_POINT_4 and is not activation quantization. QNN handles its internal packing and expansion into FP16. Raw GGUF Q4_0/Q4_1 bytes cannot be passed directly to this public tensor contract. In QAIRT 2.52.0.261104, the HTP MatMul BW_FLOAT_BLOCK validation explicitly requires a STATIC weight tensor. A direct APP_WRITE experiment fails at backendValidateOpConfig with error 3110. The separate FP16 APP_WRITE and graph-sharing options therefore cannot be combined with this native W4 path.
 
 Other source formats, CPU-owned/untracked weights, incomplete uploads and unavailable prepared payloads retain the existing FP16 lowering. Malformed values can still fail FP16 numerical validation. A QNN preparation/execution error is reported through existing backend error handling; there is no silent retry with a different graph.
 
@@ -39,9 +39,9 @@ With the flag enabled, QAIRT buffers report `is_host=false`, although their stor
 
 `buffer_set` and `buffer_memset` preserve the original GGML representation and notify the buffer-owned preparation cache. An eligible weight becomes ready only after upload ranges cover its entire source payload. Out-of-order chunks are merged; initial preparation runs once after full coverage. There are at most 128 tracked disjoint ranges per initial upload.
 
-`w4_weight_upload` holds an immutable `w4_weights` payload containing signed byte codes and block metadata. Allocation-relative tensor addresses identify entries; width and row count are checked before reuse. Buffer mutexes protect cache access. Overlapping writes through aliases invalidate affected entries. Once the source is fully initialized, subsequent partial writes rebuild the affected weight eagerly during the write callback. Existing readers retain their previous immutable payload. Buffer clear removes sidecars; reset changes preparation generation without changing source bytes or dropping valid sidecars. Buffer destruction releases the cache.
+`w4_weight_upload` holds an immutable `w4_weights` payload containing signed byte codes and block metadata. Allocation-relative tensor addresses identify entries; source type, width and row count are checked before reuse. Buffer mutexes protect cache access. Overlapping writes through aliases invalidate affected entries. Once the source is fully initialized, subsequent partial writes rebuild the affected weight eagerly during the write callback. Existing readers retain their previous immutable payload. Buffer clear removes sidecars; reset changes preparation generation without changing source bytes or dropping valid sidecars. Buffer destruction releases the cache.
 
-Repacking expands integer nibbles and remaps their signs. It converts only one FP16 block delta to FP32 per 32 values; it does not generate a host FP16 weight matrix. Zero, negative and positive deltas are handled explicitly, and nonfinite scales or weights exceeding the FP16 range are rejected.
+Repacking expands integer nibbles and remaps their signs. It converts only the FP16 block delta and, for Q4_1, its FP16 minimum to FP32 per 32 values; it does not generate a host FP16 weight matrix. Zero, negative and positive deltas are handled explicitly, and nonfinite scales or weights exceeding the FP16 range are rejected.
 
 For a stored nibble `u` and Q4_0 delta `d`, the source value is `d*(u-8)`:
 
@@ -51,11 +51,21 @@ For a stored nibble `u` and Q4_0 delta `d`, the source value is `d*(u-8)`:
 | `d < 0` | `7-u` | `abs(d)` | 1 |
 | `d == 0` | 0 | 1 | 0 |
 
+Q4_1 stores `w=d*u+m` in a 20-byte block. It uses the same signed carrier and block partition, with an asymmetric floating offset:
+
+| Q4_1 delta | Signed code | Scale | Canonical offset |
+|---|---|---|---|
+| `d > 0` | `u-8` | `d` | `8+m/d` |
+| `d < 0` | `7-u` | `abs(d)` | `m/abs(d)-7` |
+| `d == 0` | 0 | 1 | `m` |
+
+No host FP16 matrix is created for this path. Finite fractional offsets and zero-scale constant blocks are validated. The source type is part of upload-cache identity. With W4 disabled, both Q4 formats decode through their GGML type traits into FP16.
+
 The tested SDK's expansion behaves as `(code+offset)*scale`. This observed behavior differs from the public header's physical-offset formula. The released tensor registration also mutates the supplied offset array. Each `tensor_record` therefore copies canonical metadata into its own mutable ABI arrays before registration. Graphs and shape profiles never share those mutable arrays.
 
 ```mermaid
 flowchart TD
-    A[GGUF Q4_0 source] --> B[QAIRT weight allocation]
+    A[GGUF Q4_0 or Q4_1 source] --> B[QAIRT weight allocation]
     B --> C[Backend upload callbacks during model loading]
     C --> D[Merge initial upload coverage]
     D --> E[Integer repack and block metadata]
@@ -74,7 +84,7 @@ sequenceDiagram
     participant B as QAIRT buffer/cache
     participant P as Partition builder
     participant Q as QNN/HTP
-    L->>B: Allocate WEIGHTS buffer and upload Q4_0
+    L->>B: Allocate WEIGHTS buffer and upload Q4_0 or Q4_1
     B->>B: Repack once when initial upload completes
     L->>P: First inference for a shape profile
     P->>B: Retrieve immutable prepared payload
@@ -88,11 +98,11 @@ sequenceDiagram
     P->>Q: Refresh boundaries; execute cached graph
 ```
 
-Weight repacking is initialization work. Graph compilation still occurs on first use of a shape profile. Runtime execution does not unpack Q4_0 weights on the native branch. Structural cache keys include the runtime mode, recipe revision, shapes, types and tracked allocation identity/generation. Source mutations invalidate prepared graphs through existing generation checks.
+Weight repacking is initialization work. Graph compilation still occurs on first use of a shape profile. Runtime execution does not unpack Q4_0/Q4_1 weights on the native branch. Structural cache keys include the runtime mode, recipe revision, shapes, types and tracked allocation identity/generation. Source mutations invalidate prepared graphs through existing generation checks.
 
 ## Memory and diagnostics
 
-For `N*K` weights, canonical sidecar payload bytes are `N*K + (N*K/32)*8`: signed codes plus scale/offset pairs. For a 2048-by-2048 matrix this is 5,242,880 bytes, versus 8,388,608 bytes for an FP16 matrix. Original Q4_0 storage remains allocated. Graph-local metadata copies, QNN compiled weights, compiler scratch, graph caches and driver memory are additional. This is not zero-copy loading or a total-memory guarantee.
+For `N*K` weights, canonical sidecar payload bytes are `N*K + (N*K/32)*8`: signed codes plus scale/offset pairs. For a 2048-by-2048 matrix this is 5,242,880 bytes, versus 8,388,608 bytes for an FP16 matrix. Original GGUF quantized storage remains allocated. Graph-local metadata copies, QNN compiled weights, compiler scratch, graph caches and driver memory are additional. This is not zero-copy loading or a total-memory guarantee.
 
 `GGML_QAIRT_DIAGNOSTICS=1` reports initialization names, dimensions, payload bytes and repack count; connected-graph diagnostics include the native W4 projection count. `ggml_backend_qairt_stats.w4_preparations` counts native projection nodes in successfully finalized graphs. `w4_executions` counts native projection nodes in successfully executed graphs. These counters are not host repack counters. A projection reused by three finalized shape profiles contributes three preparations while retaining one upload-time canonical payload.
 
@@ -142,3 +152,8 @@ The first all-block W4FP16 run with this budget completed prefill, then failed d
 `ggml_backend_qairt_stats` reports successful preparations, cache hits, executions and failed finalizations. `preparation_time_us` covers graph/context creation, lowering, tensor/node registration and finalization for attempts that reach finalization. `finalization_time_us` measures `graph_owner::finalize()`, including `api.graphFinalize`, for successful and failed calls. Finalization time is included in preparation time; do not add the totals. Cache hits add no preparation or finalization time. The model fixture prints graph statistics on aborted decode as well as completed frames.
 
 Detailed 4 GiB results are in `QAIRT_W4FP16_cache4GiB_full_model_results.md` and `QAIRT_W4FP16_cache4GiB_full_model_validation.json` in the integration documentation directory. The first aborted capture is preserved separately as `QAIRT_W4FP16_cache4GiB_initial_abort.json`; it lacks first-decode timing because its fixture returned before printing that frame's counters.
+## Q4_1 extension (November 21, 2026)
+
+`GGML_QAIRT_W4FP16=1` now includes Q4_1 projections. `tests/test-qairt-ffn.cpp` validates actual Qwen3 block-2 gate/up/down weights as one QNN graph, including RMSNorm, scale, SwiGLU decomposition and residual Add. Both M=1 and M=23 pass every intermediate checkpoint against FP16-emulated CPU and a QNN FP16-weight graph, at NMSE <= 1e-5. Worst W4-versus-CPU checkpoint NMSE is 3.89791557565e-6.
+
+The model validation harness admits and counts Q4_1 projections rather than forcing them into CPU buffers. Earlier model and graph-boundary results in this document predate this extension; the 25/26-block boundary has not been rerun. STATIC weights remain required. Optional synthetic FFN diagnostics expose cancellation-sensitive intermediate accuracy failures; this extension does not establish a universal W4 accuracy guarantee.

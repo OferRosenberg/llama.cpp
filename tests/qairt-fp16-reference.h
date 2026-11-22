@@ -222,7 +222,7 @@ private:
         if (!selected(t) || std::string(ggml_get_name(t)) == "result_output") { return false; }
         switch (t->op) {
             case GGML_OP_MUL_MAT:
-                return !ggml_is_quantized(t->src[0]->type) || t->src[0]->type == GGML_TYPE_Q4_0;
+                return !ggml_is_quantized(t->src[0]->type) || (t->src[0]->type == GGML_TYPE_Q4_0 || t->src[0]->type == GGML_TYPE_Q4_1);
             case GGML_OP_RMS_NORM: case GGML_OP_MUL: case GGML_OP_ADD: case GGML_OP_ROPE:
             case GGML_OP_SOFT_MAX: case GGML_OP_GLU: case GGML_OP_SET_ROWS: case GGML_OP_GET_ROWS:
             case GGML_OP_CONT: return true;

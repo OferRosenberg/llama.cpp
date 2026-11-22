@@ -67,8 +67,8 @@ void weight_written(ggml_backend_buffer_t b, ggml_tensor * t, size_t offset, siz
     if (!eligible) { return; }
     try {
         auto & entry = c->weights[begin]; entry.bytes = ggml_nbytes(t);
-        auto prepared = entry.upload.update({static_cast<const uint8_t *>(t->data),entry.bytes},size_t(t->ne[0]),size_t(t->ne[1]),offset,size);
-        const auto payload = entry.upload.get(size_t(t->ne[0]),size_t(t->ne[1]));
+        auto prepared = entry.upload.update({static_cast<const uint8_t *>(t->data),entry.bytes},size_t(t->ne[0]),size_t(t->ne[1]),offset,size,t->type);
+        const auto payload = entry.upload.get(size_t(t->ne[0]),size_t(t->ne[1]),t->type);
         if (prepared.ok() && payload && c->diagnostics) {
             GGML_LOG_INFO("qairt: W4FP16 initialized %s K=%zu N=%zu bytes=%zu repacks=%llu\n",ggml_get_name(t),payload->width,payload->rows,payload->bytes(),(unsigned long long)entry.upload.preparations());
         }

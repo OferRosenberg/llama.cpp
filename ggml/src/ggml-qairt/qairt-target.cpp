@@ -43,6 +43,12 @@ status config_parser::validate(const runtime_config & config) {
     if (config.enable_w4fp16 && config.target != target_kind::htp) {
         return status::failure(host_error(error_stage::configuration, "GGML_QAIRT_W4FP16", "W4FP16 requires HTP", config.target));
     }
+    if (config.app_write_weights && config.enable_w4fp16) {
+        return status::failure(host_error(error_stage::configuration, "GGML_QAIRT_APP_WRITE_WEIGHTS", "HTP BW_FLOAT_BLOCK weights require STATIC tensors", config.target));
+    }
+    if (config.share_weight_graphs && !config.app_write_weights) {
+        return status::failure(host_error(error_stage::configuration, "GGML_QAIRT_SHARE_WEIGHT_GRAPHS", "Graph sharing requires APP_WRITE weights", config.target));
+    }
     return status::success();
 }
 
@@ -58,7 +64,10 @@ result<runtime_config> config_parser::from_environment() {
     if (directory) { config.library_directory = directory; }
     for (const auto & option : { std::make_pair("GGML_QAIRT_PROFILE", &config.enable_profile),
                                 std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics),
-                                std::make_pair("GGML_QAIRT_W4FP16", &config.enable_w4fp16) }) {
+                                std::make_pair("GGML_QAIRT_W4FP16", &config.enable_w4fp16),
+                                std::make_pair("GGML_QAIRT_APP_WRITE_WEIGHTS", &config.app_write_weights),
+                                std::make_pair("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", &config.share_weight_graphs),
+                                std::make_pair("GGML_QAIRT_SHARED_CONTEXT", &config.shared_context) }) {
         const char * value = std::getenv(option.first);
         if (!value) { continue; }
         if (std::string_view(value) != "0" && std::string_view(value) != "1") {

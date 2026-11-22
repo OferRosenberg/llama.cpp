@@ -1,6 +1,6 @@
 # QAIRT backend
 
-Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. Numerical QNN tensors are FP16 by default. Opt-in `GGML_QAIRT_W4FP16=1` supplies native block-quantized Q4_0 projection weights with FP16 activations and outputs. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
+Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. Numerical QNN tensors are FP16 by default. Opt-in `GGML_QAIRT_W4FP16=1` supplies native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
 
 
 The registered ggml-qairt backend now supports expanded FP16 HTP recipes for projections, normalization/scales, residuals, SiLU/SwiGLU, RoPE, masked Softmax, grouped attention, Gather and KV ScatterNd. By default, numerical QNN tensors use FP16; index/control tensors use SDK-required integer types. GPU/CPU target policies remain architecturally present but disabled.

@@ -12,6 +12,9 @@ struct runtime_config {
     target_kind target = target_kind::htp;
     std::filesystem::path library_directory;
     bool enable_w4fp16 = false;
+    bool app_write_weights = false;
+    bool share_weight_graphs = false;
+    bool shared_context = false;
     bool enable_profile = false;
     bool verbose_diagnostics = false;
 };
