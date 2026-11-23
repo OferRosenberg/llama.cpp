@@ -350,14 +350,14 @@ private:
 status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,std::vector<pending_output> & pending) {
     try {
         tensor_inventory inventory(nodes);
-        std::vector<uint64_t> key {0x504152544954494fULL,3,uint64_t(runtime_->config().enable_w4fp16),uint64_t(runtime_->config().app_write_weights),uint64_t(runtime_->config().share_weight_graphs),nodes.size(),inventory.tensors.size()};
+        std::vector<uint64_t> key {0x504152544954494fULL,4,uint64_t(runtime_->config().enable_w4fp16),uint64_t(runtime_->config().app_write_weights),nodes.size(),inventory.tensors.size()};
         for (const auto * t:inventory.tensors) {
             key.push_back(t->op);key.push_back(t->type);key.push_back(t->view_offs);
             for(size_t i=0;i<4;++i){key.push_back(t->ne[i]);key.push_back(t->nb[i]);}
             for(size_t i=0;i<sizeof(t->op_params)/4;++i){uint32_t word;std::memcpy(&word,reinterpret_cast<const uint8_t *>(t->op_params)+i*4,4);key.push_back(word);}
             for(const auto * source:t->src){const auto found=inventory.slots.find(source);key.push_back(found==inventory.slots.end()?SIZE_MAX:found->second);}
             const auto parent=inventory.slots.find(t->view_src);key.push_back(parent==inventory.slots.end()?SIZE_MAX:parent->second);
-            if(constant_tensor(t,pending) && !runtime_->config().share_weight_graphs) {
+            if(constant_tensor(t,pending)) {
                 const auto buffer=t->view_src?t->view_src->buffer:t->buffer;const auto * allocation=static_cast<const buffer_context *>(buffer->context);
                 key.push_back(1);key.push_back(allocation->identity);key.push_back(allocation->generation);
                 key.push_back(reinterpret_cast<uintptr_t>(t->data)-reinterpret_cast<uintptr_t>(allocation->storage));
@@ -366,15 +366,16 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
         prepared_run * entry=nullptr;
         for(size_t i=0;i<cache_.size();++i){if(cache_[i]->key==key){auto hit=std::move(cache_[i]);cache_.erase(cache_.begin()+i);cache_.push_back(std::move(hit));entry=cache_.back().get();++stats_.cache_hits;break;}}
         if(!entry) {
+            if(archive_mode_ && !preparing_) { throw partition_error("Loaded phase has no matching graph profile"); }
             if(!reserve_cache(0)){throw partition_error("Graph cache limit");}
             const auto preparation_start = std::chrono::steady_clock::now();
             auto fresh=std::make_unique<prepared_run>();fresh->key=std::move(key);fresh->partition=std::make_unique<partition_data>();
             std::shared_ptr<context_owner> graph_context;
-            if (runtime_->config().shared_context) {
+            if (runtime_->config().shared_context || archive_mode_) {
                 if (!shared_context_) { shared_context_ = checked(context_owner::create(runtime_)); }
                 graph_context = shared_context_;
             } else { graph_context = checked(context_owner::create(runtime_)); }
-            const auto graph_name = runtime_->config().shared_context ? "connected_partition_" + std::to_string(++next_graph_name_) : "connected_partition";
+            const auto graph_name = (runtime_->config().shared_context || archive_mode_) ? "connected_partition_" + std::to_string(++next_graph_name_) : "connected_partition";
             fresh->graph=checked(graph_owner::create(std::move(graph_context),graph_name));
             partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,runtime_->config().enable_w4fp16,runtime_->config().app_write_weights);
             builder.lower();
@@ -404,6 +405,7 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
             stats_.w4_preparations += fresh->partition->w4_matmuls;
             cache_.push_back(std::move(fresh));entry=cache_.back().get();++stats_.preparations;
         }
+        if(preparing_) { return status::success(); }
         // Refresh selected position tables; cache owns values, never GGML tensor pointers.
         std::unordered_map<uint32_t,std::vector<fp16_bits>> selected_tables;
         for(auto & recipe:entry->partition->ropes) {

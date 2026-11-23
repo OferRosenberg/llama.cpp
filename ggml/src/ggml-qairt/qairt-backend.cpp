@@ -141,7 +141,7 @@ bool backend_context::reserve_cache(size_t additional, const prepared_run * keep
     for (const auto & entry : cache_) { retained += entry->static_bytes; }
     while ((!keep && cache_.size() >= cache_limit) || retained > static_cache_limit - additional) {
         // QNN graph resources live until contextFree; individual eviction cannot reclaim them.
-        if (runtime_->config().shared_context) { return false; }
+        if (runtime_->config().shared_context || archive_mode_) { return false; }
         auto victim = std::find_if(cache_.begin(), cache_.end(), [keep](const auto & entry) { return entry.get() != keep; });
         if (victim == cache_.end()) { return false; }
         retained -= (*victim)->static_bytes; cache_.erase(victim);
@@ -155,6 +155,7 @@ enum ggml_status backend_context::compute(ggml_cgraph * graph) {
         invalidate();
         return GGML_STATUS_FAILED;
     };
+    if (archive_mode_ && !preparing_ && (!archives_loaded_ || archive_phase_<0)) { return fail(conversion_error("No loaded phase selected")); }
     struct log_scope {
         runtime_owner & runtime;
         QnnLog_Level_t previous;

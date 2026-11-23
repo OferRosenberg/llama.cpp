@@ -1,6 +1,6 @@
 # QAIRT runtime W4FP16 weights
 
-Implementation date: November 19, 2026. The existing full-FP16 path remains the default.
+Implementation date: November 19, 2026. W4FP16 is enabled by default as of November 23, 2026. Set GGML_QAIRT_W4FP16=0 for full-FP16 execution.
 
 ## Configuration
 
@@ -14,7 +14,7 @@ $env:ADSP_LIBRARY_PATH = 'C:\Qualcomm\AIStack\QAIRT\2.52.0.261104\lib\hexagon-v7
 $env:PATH = $env:GGML_QAIRT_LIBRARY_DIR + ';' + $env:PATH
 ```
 
-`GGML_QAIRT_W4FP16` accepts only `0` or `1`; default `0`. Configuration is captured once per process. Enabling it requires HTP and a discovered HTP architecture of V69 or newer. GPU/CPU execution policies remain disabled. Changing the environment after capture does not change an existing backend.
+`GGML_QAIRT_W4FP16` accepts only `0` or `1`; default `1`. Configuration is captured once per process. Enabling it requires HTP and a discovered HTP architecture of V69 or newer. GPU/CPU execution policies remain disabled. Changing the environment after capture does not change an existing backend.
 
 ## Scope and tensor contract
 
@@ -29,7 +29,7 @@ The native path applies to admitted `GGML_OP_MUL_MAT` projections with contiguou
 | Other numerical operations and weights | Existing FP16 path | Unchanged admission rules |
 | Indices and control tensors | Existing SDK-required integer types | Unchanged narrowing and validation |
 
-`transpose_in0=false`, `transpose_in1=true`. The byte carrier stores four-bit values sign-extended to eight bits; it is not packed QNN SFIXED_POINT_4 and is not activation quantization. QNN handles its internal packing and expansion into FP16. Raw GGUF Q4_0/Q4_1 bytes cannot be passed directly to this public tensor contract. In QAIRT 2.52.0.261104, the HTP MatMul BW_FLOAT_BLOCK validation explicitly requires a STATIC weight tensor. A direct APP_WRITE experiment fails at backendValidateOpConfig with error 3110. The separate FP16 APP_WRITE and graph-sharing options therefore cannot be combined with this native W4 path.
+`transpose_in0=false`, `transpose_in1=true`. The byte carrier stores four-bit values sign-extended to eight bits; it is not packed QNN SFIXED_POINT_4 and is not activation quantization. QNN handles its internal packing and expansion into FP16. Raw GGUF Q4_0/Q4_1 bytes cannot be passed directly to this public tensor contract. In QAIRT 2.52.0.261104, the HTP MatMul BW_FLOAT_BLOCK validation explicitly requires a STATIC weight tensor. A direct APP_WRITE experiment fails at backendValidateOpConfig with error 3110. The FP16 APP_WRITE option therefore requires explicitly disabling W4FP16.
 
 Other source formats, CPU-owned/untracked weights, incomplete uploads and unavailable prepared payloads retain the existing FP16 lowering. Malformed values can still fail FP16 numerical validation. A QNN preparation/execution error is reported through existing backend error handling; there is no silent retry with a different graph.
 

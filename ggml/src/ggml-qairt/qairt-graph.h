@@ -5,6 +5,9 @@
 
 namespace ggml::qairt {
 
+struct binary_tensor { tensor_spec spec; tensor_id id; };
+struct binary_graph { std::string name; std::vector<binary_tensor> io; };
+
 class graph_owner;
 class context_owner final {
 public:
@@ -16,6 +19,10 @@ public:
     Qnn_ContextHandle_t handle() const noexcept { return context_.get(); }
     std::shared_ptr<runtime_owner> runtime() const noexcept { return runtime_; }
     status close();
+    result<std::string> save_binary(const std::filesystem::path & path);
+    static result<std::shared_ptr<context_owner>> from_binary(std::shared_ptr<runtime_owner> runtime,
+        const std::filesystem::path & path, const std::string & digest);
+    const std::vector<binary_graph> & binary_graphs() const noexcept { return binary_graphs_; }
 private:
     friend class graph_owner;
     context_owner() = default;
@@ -25,6 +32,8 @@ private:
     unique_qnn_handle<context_tag> context_;
     uint32_t active_graphs_ = 0;
     bool admitted_ = false;
+    std::vector<uint8_t> binary_;
+    std::vector<binary_graph> binary_graphs_;
 };
 
 enum class graph_state { building, finalized, failed, closed };
@@ -58,6 +67,8 @@ public:
     result<tensor_id> register_tensor(tensor_spec spec, buffer_view_const payload);
     status add_node(const op_spec & spec);
     status finalize();
+    status suspend();
+    result<std::vector<std::pair<tensor_id,tensor_id>>> restore(std::shared_ptr<context_owner> context);
     status execute(execution_binding & binding) const;
     status close();
     const tensor_record * find_tensor(tensor_id id) const noexcept;

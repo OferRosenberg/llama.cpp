@@ -6,10 +6,14 @@
 #include "qairt-weights.h"
 #include "ggml-qairt.h"
 #include "qairt-fp16-reference.h"
+#include "llama-context.h"
+#include <filesystem>
+#include <fstream>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +25,10 @@
 using model_ptr = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
 using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
 using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
+using timing_clock = std::chrono::steady_clock;
+static double elapsed_ms(timing_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(timing_clock::now() - start).count();
+}
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
 static std::atomic<bool> qnn_log_phase {false};
@@ -32,7 +40,7 @@ static bool set_probe_phase(const char * phase) {
 #endif
 }
 static void logger(ggml_log_level level, const char * text, void *) {
-    if ((qnn_log_phase.load() && std::strstr(text, "qairt:")) || std::strstr(text, "qairt: inventory") || level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
+    if ((qnn_log_phase.load() && std::strstr(text, "qairt:")) || std::strstr(text, "qairt: inventory") || std::strstr(text, "qairt: archive ") || level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
 }
 struct observation;
 static bool observe(ggml_tensor *, bool, void *);
@@ -48,6 +56,124 @@ public:
         active_ = nullptr;
     }
     void clear() { projections.clear(); operations.clear(); others = 0; graph_counts = {}; }
+    bool archive(int action, ggml_cgraph * graph=nullptr, const char * path=nullptr) {
+        if(original_.size()!=1){std::fprintf(stderr,"Archive experiment requires one QAIRT scheduler backend\n");return false;}
+        auto * backend=original_.begin()->first;
+        const auto fn=reinterpret_cast<ggml_backend_qairt_archive_t>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device_),"ggml_backend_qairt_archive"));
+        if(!fn){std::fprintf(stderr,"Archive procedure missing action=%d\n",action);return false;}
+        backend->iface.graph_compute=original_.at(backend).graph_compute;
+        const bool result=fn(backend,action,graph,path);
+        backend->iface.graph_compute=compute;
+        if (!result) { std::fprintf(stderr, "Archive action=%d failed nodes=%d\n", action, graph ? ggml_graph_n_nodes(graph) : 0); }
+        return result;
+    }
+    bool snapshot_stats(ggml_backend_qairt_stats & stats) {
+        if (original_.size() != 1) { return false; }
+        auto * backend = original_.begin()->first;
+        const auto get_stats = reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device_), "ggml_backend_qairt_get_stats"));
+        const auto previous = backend->iface.graph_compute;
+        backend->iface.graph_compute = original_.at(backend).graph_compute;
+        const bool result = get_stats && get_stats(backend, &stats);
+        backend->iface.graph_compute = previous;
+        return result;
+    }
+    bool prepare_archives(llama_context * context, uint32_t tokens, const std::filesystem::path & directory) {
+        if (!tokens || tokens > 128 || llama_n_ctx(context) != 256) { return false; }
+        const char * diagnostic_setting = std::getenv("GGML_QAIRT_DIAGNOSTICS");
+        const bool diagnostics = diagnostic_setting && std::strcmp(diagnostic_setting, "1") == 0;
+        struct diagnostic_scope {
+            std::string phase;
+            bool logging;
+            bool & capture;
+            explicit diagnostic_scope(bool & captured) : logging(qnn_log_phase.load()), capture(captured) {
+                const char * previous = std::getenv("GGML_QAIRT_DIAGNOSTIC_PHASE");
+                phase = previous ? previous : "";
+            }
+            ~diagnostic_scope() {
+                capture = false;
+                qnn_log_phase.store(logging);
+                CHECK(set_probe_phase(phase.empty() ? nullptr : phase.c_str()));
+            }
+        } diagnostic_guard(capture_);
+        std::filesystem::create_directories(directory);
+        std::ofstream manifest(directory / "manifest.txt", std::ios::trunc);
+        manifest << "QAIRT phase archives v1\nblocks=" << (layer_ + 1) << "\nprefill_tokens=" << tokens << "\nkv_extent=256\n";
+        for (int phase = 0; phase < 2; ++phase) {
+            const char * name = phase ? "decode" : "prefill";
+            if (diagnostics && !set_probe_phase(phase ? "compile_decode" : "compile_prefill")) { return false; }
+            const auto context_start = timing_clock::now();
+            if (!archive(phase ? GGML_QAIRT_ARCHIVE_BEGIN_DECODE : GGML_QAIRT_ARCHIVE_BEGIN_PREFILL)) { return false; }
+            const double context_ms = elapsed_ms(context_start);
+            const auto build_start = timing_clock::now();
+            const auto memory = llama_get_memory(context)->init_full();
+            captured_.clear(); capture_ = true;
+            auto * graph = context->graph_reserve(phase ? 1 : tokens, 1, 1, memory.get());
+            captured_.clear();
+            const bool allocated = graph && ggml_backend_sched_alloc_graph(context->get_sched(), graph);
+            capture_ = false;
+            const double build_ms = elapsed_ms(build_start);
+            if (diagnostics) {
+                std::fprintf(stderr, "QNN archive capture phase=%s graph=%d allocated=%d splits=%d captured=%zu backends=%zu\n",
+                    name, graph != nullptr, allocated, ggml_backend_sched_get_n_splits(context->get_sched()), captured_.size(), original_.size());
+            }
+            if (!allocated || captured_.empty()) { return false; }
+            ggml_backend_qairt_stats before {}, after {};
+            if (!snapshot_stats(before)) { return false; }
+            const auto compile_start = timing_clock::now();
+            size_t nodes = 0, partitions = 0;
+            for (auto & split : captured_) {
+                nodes += size_t(ggml_graph_n_nodes(&split));
+                // Match scheduler evaluation boundaries without evaluating tensor data.
+                for (int begin = 0; begin < split.n_nodes;) {
+                    int end = begin;
+                    while (end + 1 < split.n_nodes && !observe(split.nodes[end], true, fused_observation)) { ++end; }
+                    auto view = split;
+                    view.nodes = split.nodes + begin;
+                    view.n_nodes = end + 1 - begin;
+                    if (!archive(GGML_QAIRT_ARCHIVE_PREPARE, &view)) { return false; }
+                    ++partitions;
+                    begin = end + 1;
+                }
+            }
+            const double compile_ms = elapsed_ms(compile_start);
+            if (!snapshot_stats(after)) { return false; }
+            CHECK(after.executions == before.executions);
+            std::printf("QNN timing phase=compile_%s wall_ms=%.3f context_ms=%.3f graph_build_ms=%.3f backend_prepare_ms=%.3f finalize_ms=%.3f graphs=%llu executions=%llu\n",
+                name, compile_ms, context_ms, build_ms,
+                double(after.preparation_time_us - before.preparation_time_us) / 1000.0,
+                double(after.finalization_time_us - before.finalization_time_us) / 1000.0,
+                (unsigned long long) (after.preparations - before.preparations),
+                (unsigned long long) (after.executions - before.executions));
+            std::fflush(stdout);
+            const auto path = (directory / (phase ? "decode.bin" : "prefill.bin")).u8string();
+            captured_.clear();
+            const auto save_start = timing_clock::now();
+            if (!archive(GGML_QAIRT_ARCHIVE_SAVE, nullptr, path.c_str())) { return false; }
+            const double save_ms = elapsed_ms(save_start);
+            manifest << name << "_graphs=" << partitions << "\n" << name << "_compile_ms=" << compile_ms
+                     << "\n" << name << "_archive_ms=" << save_ms << "\n";
+            std::printf("QNN timing phase=archive_%s wall_ms=%.3f\n", name, save_ms);
+            std::printf("QNN archive phase=%s graphs=%zu ggml_nodes=%zu bytes=%llu executions=0\n",
+                name, partitions, nodes, (unsigned long long) std::filesystem::file_size(std::filesystem::u8path(path)));
+            std::fflush(stdout);
+        }
+        ggml_backend_sched_reset(context->get_sched());
+        llama_get_memory(context)->clear(true);
+        if (diagnostics && !set_probe_phase("load_archives")) { return false; }
+        if (diagnostics) { qnn_log_phase.store(true); }
+        const auto load_start = timing_clock::now();
+        const bool loaded = archive(GGML_QAIRT_ARCHIVE_LOAD);
+        const double load_ms = elapsed_ms(load_start);
+        qnn_log_phase.store(false);
+        // diagnostic_guard restores the caller state on success and failure.
+        manifest << "load_both_ms=" << load_ms << "\n";
+        std::printf("QNN timing phase=load_both wall_ms=%.3f status=%s\n", load_ms, loaded ? "ok" : "failed");
+        std::fflush(stdout);
+        return loaded;
+    }
+    bool collect_observations = true;
     void * fused_observation = nullptr;
     ggml_backend_qairt_stats graph_counts {};
     std::map<std::string,int> operations;
@@ -89,9 +215,14 @@ private:
         auto backend = active_->init_(device, params);
         if (backend) {
             active_->original_[backend] = backend->iface;
-            backend->iface.graph_compute = compute; backend->iface.free = release;
+            backend->iface.graph_compute = compute; backend->iface.free = release; backend->iface.graph_optimize = optimize;
         }
         return backend;
+    }
+    static void optimize(ggml_backend_t backend, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+        const auto original=active_->original_.at(backend).graph_optimize;
+        if(original){original(backend,graph,params);}
+        if(active_->capture_){active_->captured_.push_back(*graph);}
     }
     static ggml_status compute(ggml_backend_t backend, ggml_cgraph * graph) {
         const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
@@ -111,7 +242,7 @@ private:
         active_->graph_counts.preparation_time_us += after.preparation_time_us - before.preparation_time_us;
         active_->graph_counts.finalization_time_us += after.finalization_time_us - before.finalization_time_us;
         active_->graph_counts.finalization_failures += after.finalization_failures - before.finalization_failures;
-        if (status == GGML_STATUS_SUCCESS) {
+        if (status == GGML_STATUS_SUCCESS && active_->collect_observations) {
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto * t = ggml_graph_node(graph, i);
                 if (active_->fused_observation) { observe_backend(t, active_->fused_observation); }
@@ -136,6 +267,8 @@ private:
     int first_;
     bool all_;
     std::map<ggml_backend_t, ggml_backend_i> original_;
+    bool capture_ = false;
+    std::vector<ggml_cgraph> captured_;
 };
 
 
@@ -176,7 +309,7 @@ static std::vector<float> download(ggml_tensor * tensor) {
 }
 struct observation {
     int layer = 0, first = 0;
-    bool fused = false, in_backend = false;
+    bool fused = false, in_backend = false, timing_only = false;
     fp16_reference * fp16 = nullptr;
     backend_ptr cpu {nullptr, ggml_backend_free};
     std::map<std::string, std::vector<float>> tensors;
@@ -215,6 +348,7 @@ static void local_projection(ggml_tensor * tensor, observation & seen) {
 }
 static bool observe(ggml_tensor * tensor, bool ask, void * user) {
     auto & seen = *static_cast<observation *>(user);
+    if (!ask && seen.timing_only) { return true; }
     const std::string name = ggml_get_name(tensor), suffix = "-" + std::to_string(seen.layer);
     bool selected = false;
     for (int layer = seen.first; layer <= seen.layer; ++layer) {
@@ -281,6 +415,51 @@ static int decode(llama_context * ctx, const std::vector<llama_token> & tokens, 
     }
     const int status = llama_decode(ctx, batch); llama_batch_free(batch); return status;
 }
+static bool time_archive_execution(llama_context * context, const std::vector<llama_token> & prefix,
+                                   const std::vector<llama_token> & decode_tokens, execution_observer & executed,
+                                   observation & seen, int graphs_per_frame) {
+    struct timing_scope {
+        execution_observer & executed;
+        observation & seen;
+        bool collect, timing_only;
+        timing_scope(execution_observer & e, observation & s) : executed(e), seen(s),
+            collect(e.collect_observations), timing_only(s.timing_only) {
+            executed.collect_observations = false;
+            seen.timing_only = true;
+        }
+        ~timing_scope() { executed.collect_observations = collect; seen.timing_only = timing_only; }
+    } scope(executed, seen);
+    seen.clear(); executed.clear();
+    llama_memory_clear(llama_get_memory(context), true);
+    if (!executed.archive(GGML_QAIRT_ARCHIVE_SELECT_PREFILL)) { return false; }
+    const auto prefill_start = timing_clock::now();
+    const int prefill_status = decode(context, prefix, 0);
+    const double prefill_ms = elapsed_ms(prefill_start);
+    if (prefill_status != 0) { std::fprintf(stderr, "Timed prefill failed status=%d\n", prefill_status); return false; }
+    std::printf("QNN throughput phase=prefill tokens=%zu elapsed_ms=%.3f tps=%.6f observations=off cache=loaded\n",
+        prefix.size(), prefill_ms, prefill_ms > 0 ? double(prefix.size()) * 1000.0 / prefill_ms : 0);
+    std::fflush(stdout);
+    if (!executed.archive(GGML_QAIRT_ARCHIVE_SELECT_DECODE)) { return false; }
+    const auto decode_start = timing_clock::now();
+    int position = int(prefix.size());
+    for (const auto token : decode_tokens) {
+        const int status = decode(context, {token}, position++);
+        if (status != 0) { std::fprintf(stderr, "Timed decode failed position=%d status=%d\n", position - 1, status); return false; }
+    }
+    const double decode_ms = elapsed_ms(decode_start);
+    std::printf("QNN throughput phase=decode tokens=%zu elapsed_ms=%.3f tps=%.6f observations=off cache=loaded teacher_forced=1\n",
+        decode_tokens.size(), decode_ms, decode_ms > 0 ? double(decode_tokens.size()) * 1000.0 / decode_ms : 0);
+    const auto & stats = executed.graph_counts;
+    std::printf("QNN throughput reuse graphs_created=%llu cache_hits=%llu executions=%llu finalization_failures=%llu\n",
+        (unsigned long long) stats.preparations, (unsigned long long) stats.cache_hits,
+        (unsigned long long) stats.executions, (unsigned long long) stats.finalization_failures);
+    const uint64_t expected = uint64_t(graphs_per_frame) * (decode_tokens.size() + 1);
+    const bool reused = stats.preparations == 0 && stats.finalization_failures == 0 &&
+        stats.executions == expected && stats.cache_hits == expected && seen.tensors.empty() && seen.local_count == 0;
+    CHECK(reused);
+    std::fflush(stdout);
+    return reused;
+}
 static context_ptr make_context(llama_model * model, observation & seen, int capacity, bool all = false) {
     auto p = llama_context_default_params();
     p.n_ctx = uint32_t(capacity); p.n_batch = p.n_ubatch = 128;
@@ -338,7 +517,7 @@ static void compare_activation_edges(const observation & cpu, const observation 
                     label, item.first.c_str(), input.nmse, packed.nmse, changed);
     }
 }
-struct options { bool control = false, all = true, fused = false, fp16 = false, prepare_probe = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt; };
+struct options { bool control = false, all = true, fused = false, fp16 = false, prepare_probe = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt, context_binaries; };
 static bool parse(int argc, char ** argv, options & options) {
     try {
         for (int i = 2; i < argc; ++i) {
@@ -350,6 +529,7 @@ static bool parse(int argc, char ** argv, options & options) {
             if (i + 1 >= argc) { return false; }
             const std::string value = argv[++i];
             if (arg == "--ops") { if (value != "projections" && value != "all") { return false; } options.all = value == "all"; continue; }
+            if (arg == "--context-binaries") { options.context_binaries = value; continue; }
             if (arg == "--prompt") { options.prompt = value; continue; }
             if (arg == "--offload-last" && value == "all") { options.layers = -1; continue; }
             size_t used = 0; const int n = std::stoi(value, &used); if (used != value.size()) { return false; }
@@ -361,7 +541,8 @@ static bool parse(int argc, char ** argv, options & options) {
             else { return false; }
         }
     } catch (...) { return false; }
-    return (!options.fp16 || options.all) && (!options.fused || options.all) && (options.layers == -1 || (options.layers >= 1 && options.layers <= 256)) && options.steps >= 1 && options.steps <= 128 && options.capacity == 1024 &&
+    return (!options.fp16 || options.all) && (!options.fused || options.all) && (options.layers == -1 || (options.layers >= 1 && options.layers <= 256)) && options.steps >= 1 && options.steps <= 128 && (options.capacity == 1024 || (!options.context_binaries.empty() && options.capacity == 256)) &&
+           (options.context_binaries.empty() || (!options.control && options.fused && options.all && options.layers == -1 && !options.prefill && !options.tail && !options.prepare_probe)) &&
            (options.prefill == 0 || options.prefill == 128) && (options.tail == 0 || options.tail == 13);
 }
 static int fp16_reference_self_test() {
@@ -417,7 +598,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--fp16-reference-self-test") == 0) { return fp16_reference_self_test(); }
     options opt;
     if (argc < 2 || !parse(argc, argv, opt)) {
-        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--qnn-prepare-probe] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024]\n");
+        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--qnn-prepare-probe] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024] [--context-binaries DIR --ctx 256]\n");
         return 2;
     }
     if (opt.prepare_probe) { CHECK(set_probe_phase("init")); }
@@ -478,6 +659,13 @@ int main(int argc, char ** argv) {
     }
     const size_t prefix_size = opt.prefill ? size_t(opt.prefill) : tokens.size();
     std::vector<llama_token> prefix(tokens.begin(), tokens.begin() + prefix_size);
+    if(!opt.context_binaries.empty()) {
+        if(prefix.size()+size_t(opt.steps)>256 || prefix.size()>128){std::fprintf(stderr,"Archive profile exceeds fixed 256-entry KV range\n");return 2;}
+        if(!executed->prepare_archives(actual_ctx.get(),uint32_t(prefix.size()),std::filesystem::u8path(opt.context_binaries))) {
+            std::fprintf(stderr,"QNN phase archive preparation/load failed before query execution\n");return 1;
+        }
+        std::printf("QNN archives loaded before first query execution\n");std::fflush(stdout);
+    }
     std::vector<float> initial_cpu, initial_actual;
     int position = 0, disagreements = 0; bool decode_failed = false;
     llama_token actual_next = 0;
@@ -505,6 +693,7 @@ int main(int argc, char ** argv) {
             qnn_log_phase.store(std::strcmp(label, "decode0") == 0);
             std::fprintf(stderr, "qairt: inventory phase_begin phase=%s\n", label);
         }
+        if(!opt.context_binaries.empty() && !executed->archive(decode_step?GGML_QAIRT_ARCHIVE_SELECT_DECODE:GGML_QAIRT_ARCHIVE_SELECT_PREFILL)) { decode_failed=true; return llama_token(0); }
         const int actual_status = decode(actual_ctx.get(), input, position);
         if (opt.prepare_probe) {
             std::fprintf(stderr, "qairt: inventory phase_end phase=%s status=%d\n", label, actual_status);
@@ -607,6 +796,7 @@ int main(int argc, char ** argv) {
     if (decode_failed) { return 1; }
     std::string response, actual_response;
     int output_disagreements = 0;
+    std::vector<llama_token> performance_tokens;
     for (int step = 0; step < opt.steps; ++step) {
         output_disagreements += next != actual_next;
         char actual_piece[256]; const int actual_n = llama_token_to_piece(vocab, actual_next, actual_piece, sizeof(actual_piece), 0, false);
@@ -614,6 +804,7 @@ int main(int argc, char ** argv) {
         char piece[256]; const int n = llama_token_to_piece(vocab, next, piece, sizeof(piece), 0, false);
         if (n > 0 && n <= int(sizeof(piece))) { response.append(piece, size_t(n)); }
         const std::string label = "decode" + std::to_string(step);
+        performance_tokens.push_back(next);
         next = frame({next}, label.c_str(), true);
         if (decode_failed) { return 1; }
         if (opt.prepare_probe) {
@@ -634,6 +825,11 @@ int main(int argc, char ** argv) {
     if (reset_cpu && reset_actual) {
         CHECK(std::equal(initial_cpu.begin(), initial_cpu.end(), reset_cpu));
         CHECK(std::equal(initial_actual.begin(), initial_actual.end(), reset_actual));
+    }
+    if (!opt.context_binaries.empty()) {
+        std::printf("QNN throughput replay begin: CPU comparisons and tensor observations disabled\n");
+        std::fflush(stdout);
+        if (!time_archive_execution(actual_ctx.get(), prefix, performance_tokens, *executed, actual_seen, opt.layers)) { return 1; }
     }
     std::printf("Qwen3 M2a1: CPU_control=%d layers=%d selected=%d prefill=%zu tail=%d decode=%d disagreements=%d failures=%d\n",
                 int(opt.control), last + 1, last, prefix_size, opt.tail, opt.steps, disagreements, failures);

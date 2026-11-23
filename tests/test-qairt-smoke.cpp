@@ -38,6 +38,13 @@ static void test_configuration() {
     auto separate = config_parser::from_environment();
     CHECK(separate.ok() && !separate.value().shared_context);
     _putenv_s("GGML_QAIRT_SHARED_CONTEXT", "");
+    const char * w4 = std::getenv("GGML_QAIRT_W4FP16");
+    const std::string saved_w4 = w4 ? w4 : "";
+    _putenv_s("GGML_QAIRT_W4FP16", "");
+    auto defaults = config_parser::from_environment();
+    CHECK(defaults.ok() && defaults.value().shared_context);
+    CHECK(defaults.ok() && defaults.value().enable_w4fp16);
+    _putenv_s("GGML_QAIRT_W4FP16", saved_w4.c_str());
     auto htp = config_parser::parse_target("HTP");
     CHECK(htp.ok());
     if (htp.ok()) { CHECK(htp.value() == target_kind::htp); }

@@ -2,6 +2,8 @@
 
 Date: November 20, 2026. SDK: QAIRT 2.52.0.261104, QNN HTP V73, Windows ARM64. Repository branch: `Add-ggml-qairt-backedn`; baseline commit: `fd7250711`. Experimental changes are uncommitted.
 
+> November 23, 2026: cross-weight graph sharing was removed. APP_WRITE remains supported, with graph cache entries specific to weight allocations. Ordinary graphs now share a context by default. The graph-sharing results below are historical experiments.
+
 ## Outcome and scope
 
 The native W4FP16 path cannot use APP_WRITE weights with this SDK. A direct QNN test registers the BW_FLOAT_BLOCK weight as APP_WRITE but fails at `backendValidateOpConfig` with code 3110 and `Received non-Static for tensor`. HTP MatMul validation explicitly calls `CHECK_IS_STATIC_TENSOR(INPUT(opConfig,1))` for BW_FLOAT_BLOCK. This is an SDK constraint rather than a cache-key constraint.
@@ -20,7 +22,6 @@ $env:GGML_QAIRT_LIBRARY_DIR = 'C:\Qualcomm\AIStack\QAIRT\2.52.0.261104\lib\aarch
 $env:ADSP_LIBRARY_PATH = 'C:\Qualcomm\AIStack\QAIRT\2.52.0.261104\lib\hexagon-v73\unsigned'
 $env:GGML_QAIRT_W4FP16 = '0'
 $env:GGML_QAIRT_APP_WRITE_WEIGHTS = '1'
-$env:GGML_QAIRT_SHARE_WEIGHT_GRAPHS = '0' # Phase 1; use 1 for Phase 2.
 $env:GGML_QAIRT_DIAGNOSTICS = '1'
 ```
 

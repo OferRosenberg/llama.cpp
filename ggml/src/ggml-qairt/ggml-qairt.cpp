@@ -268,7 +268,25 @@ bool get_stats(ggml_backend_t backend, ggml_backend_qairt_stats * stats) {
     *stats = static_cast<backend_context *>(backend->context)->stats();
     return true;
 }
+bool archive_control(ggml_backend_t backend, int action, ggml_cgraph * graph, const char * path) {
+    if (!backend || backend->iface.graph_compute != backend_compute) { return false; }
+    try {
+        const auto result = static_cast<backend_context *>(backend->context)->archive(action,graph,path);
+        if (!result.ok()) {
+            GGML_LOG_ERROR("qairt: archive %s: %s (QNN error %llu)\n",result.error().operation.c_str(),
+                result.error().message.c_str(),(unsigned long long)result.error().qnn_error.value_or(0));
+        }
+        return result.ok();
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("qairt: archive: %s\n", error.what());
+    } catch (...) {
+        GGML_LOG_ERROR("qairt: archive: unknown exception\n");
+    }
+    static_cast<backend_context *>(backend->context)->invalidate();
+    return false;
+}
 void * registry_proc(ggml_backend_reg_t, const char * name) {
+    if (name && std::strcmp(name,"ggml_backend_qairt_archive")==0) { return reinterpret_cast<void *>(archive_control); }
     return name && std::strcmp(name, "ggml_backend_qairt_get_stats") == 0 ? reinterpret_cast<void *>(get_stats) : nullptr;
 }
 }

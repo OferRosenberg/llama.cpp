@@ -63,7 +63,7 @@ struct llama_context {
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
-    ggml_backend_sched_t get_sched() const;
+    LLAMA_API ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -281,7 +281,7 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
-    ggml_cgraph * graph_reserve(
+    LLAMA_API ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);

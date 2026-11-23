@@ -6,6 +6,9 @@
 #include "qairt-weights.h"
 #include "qairt-target.h"
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
 
 #include <algorithm>
 #include <cmath>
@@ -23,7 +26,7 @@ static int failures = 0, checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
 static context_ptr context() { return {ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free}; }
 static void logger(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "qairt: inventory")) { std::fputs(text, stderr); }
+    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "qairt: inventory") || std::strstr(text, "qairt: archive timing")) { std::fputs(text, stderr); }
 }
 static void packing_tests() {
     std::vector<uint8_t> raw(18 * 2);
@@ -343,19 +346,111 @@ static void weight_reuse_test(ggml_backend_dev_t device) {
     const auto fn=reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),"ggml_backend_qairt_get_stats"));
     CHECK(fn);if(!fn){return;}
     ggml_backend_qairt_stats stats {};CHECK(fn(backend.get(),&stats));
-    CHECK(stats.preparations==(config.value().share_weight_graphs?1:3));
-    CHECK(stats.cache_hits==(config.value().share_weight_graphs?3:1) && stats.executions==4);
-    std::printf("APP_WRITE A/B/A/mutation: preparations=%llu hits=%llu executions=%llu sharing=%d\n",(unsigned long long)stats.preparations,(unsigned long long)stats.cache_hits,(unsigned long long)stats.executions,config.value().share_weight_graphs);
+    CHECK(stats.preparations==3);
+    CHECK(stats.cache_hits==1 && stats.executions==4);
+    std::printf("APP_WRITE A/B/A/mutation: preparations=%llu hits=%llu executions=%llu\n",(unsigned long long)stats.preparations,(unsigned long long)stats.cache_hits,(unsigned long long)stats.executions);
+}
+
+
+static void context_binary_test(ggml_backend_dev_t device, bool corrupt=false) {
+    backend_ptr backend(ggml_backend_dev_init(device,nullptr),ggml_backend_free);
+    CHECK(backend); if (!backend) { return; }
+    using archive_fn = bool (*)(ggml_backend_t, int, ggml_cgraph *, const char *);
+    const auto archive = reinterpret_cast<archive_fn>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(device),"ggml_backend_qairt_archive"));
+    CHECK(archive); if (!archive) { return; }
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("qairt-binary-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const bool created = std::filesystem::create_directory(directory);
+    CHECK(created); if (!created) { return; }
+    struct temporary_directory {
+        std::filesystem::path path;
+        backend_ptr & backend;
+        ~temporary_directory() {
+            backend.reset();
+            std::error_code error;
+            for (const auto * name : {"prefill.bin", "decode.bin", "prefill.bin.tmp", "decode.bin.tmp"}) {
+                std::filesystem::remove(path / name, error);
+                CHECK(!error);
+            }
+            std::filesystem::remove(path, error);
+            CHECK(!error);
+        }
+    } directory_guard {directory, backend};
+    auto wc = context(), c = context();
+    auto * w = ggml_new_tensor_2d(wc.get(),GGML_TYPE_Q4_0,32,16);
+    buffer_ptr wb(ggml_backend_alloc_ctx_tensors(wc.get(),backend.get()),ggml_backend_buffer_free);
+    CHECK(wb); if (!wb) { return; }
+    ggml_backend_buffer_set_usage(wb.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<uint8_t> weights(ggml_nbytes(w));
+    for (size_t row=0;row<16;++row) {
+        const auto delta=ggml_fp32_to_fp16(0.25f); std::memcpy(weights.data()+row*18,&delta,2);
+        for(size_t j=0;j<16;++j){weights[row*18+2+j]=uint8_t(j|((15-j)<<4));}
+    }
+    ggml_backend_tensor_set(w,weights.data(),0,weights.size());
+    auto * xp=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,2);
+    auto * xd=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,1);
+    auto * yp=ggml_mul_mat(c.get(),w,xp); auto * yd=ggml_mul_mat(c.get(),w,xd);
+    auto * gp=ggml_new_graph(c.get());ggml_graph_add_node(gp,yp);
+    auto * gd=ggml_new_graph(c.get());ggml_graph_add_node(gd,yd);
+    buffer_ptr io(ggml_backend_alloc_ctx_tensors(c.get(),backend.get()),ggml_backend_buffer_free);
+    CHECK(io); if(!io){return;}
+    std::vector<float> input(64);input[0]=1;input[33]=1;
+    ggml_backend_tensor_set(xp,input.data(),0,input.size()*4);
+    ggml_backend_tensor_set(xd,input.data(),0,32*4);
+    const auto prefill=(directory/"prefill.bin").string(), decode=(directory/"decode.bin").string();
+    CHECK(!archive(backend.get(),GGML_QAIRT_ARCHIVE_LOAD,nullptr,nullptr));
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_BEGIN_PREFILL,nullptr,nullptr)){CHECK(false);return;}
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_PREPARE,gp,nullptr)){CHECK(false);return;}
+    const auto get_stats=reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(device),"ggml_backend_qairt_get_stats"));
+    ggml_backend_qairt_stats stats{};CHECK(get_stats && get_stats(backend.get(),&stats));
+    CHECK(stats.preparations==1 && stats.executions==0);
+    CHECK(!archive(backend.get(),GGML_QAIRT_ARCHIVE_BEGIN_DECODE,nullptr,nullptr));
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_SAVE,nullptr,prefill.c_str())){CHECK(false);return;}
+    CHECK(archive(backend.get(),GGML_QAIRT_ARCHIVE_BEGIN_DECODE,nullptr,nullptr));
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_PREPARE,gd,nullptr)){CHECK(false);return;}
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_SAVE,nullptr,decode.c_str())){CHECK(false);return;}
+    CHECK(std::filesystem::file_size(prefill)>0 && std::filesystem::file_size(decode)>0);
+    if(corrupt) {
+        std::fstream file(decode,std::ios::binary|std::ios::in|std::ios::out);
+        char byte=0;file.read(&byte,1);byte^=1;file.seekp(0);file.write(&byte,1);file.close();
+        CHECK(!archive(backend.get(),GGML_QAIRT_ARCHIVE_LOAD,nullptr,nullptr));
+        CHECK(get_stats(backend.get(),&stats) && stats.preparations==2 && stats.executions==0);
+        backend.reset();
+        return;
+    }
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_LOAD,nullptr,nullptr)){CHECK(false);return;}
+    CHECK(!archive(backend.get(),GGML_QAIRT_ARCHIVE_BEGIN_PREFILL,nullptr,nullptr));
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_SELECT_PREFILL,nullptr,nullptr)){CHECK(false);return;}
+    CHECK(ggml_backend_graph_compute(backend.get(),gp)==GGML_STATUS_SUCCESS);
+    std::vector<float> actual(32), expected(32);
+    ggml_backend_tensor_get(yp,actual.data(),0,actual.size()*4);
+    auto decoded=prepare_q4_weights({weights.data(),weights.size()},32,16);CHECK(decoded.ok());
+    if(decoded.ok()) {
+        for(size_t token=0;token<2;++token){for(size_t row=0;row<16;++row){expected[token*16+row]=ggml_fp16_to_fp32(decoded.value()[row*32+token].bits);}}
+        accuracy(actual,expected,"binary prefill");
+    }
+    if(!archive(backend.get(),GGML_QAIRT_ARCHIVE_SELECT_DECODE,nullptr,nullptr)){CHECK(false);return;}
+    CHECK(ggml_backend_graph_compute(backend.get(),gd)==GGML_STATUS_SUCCESS);
+    input[0]=0;input[1]=1;ggml_backend_tensor_set(xd,input.data(),0,32*4);
+    CHECK(ggml_backend_graph_compute(backend.get(),gd)==GGML_STATUS_SUCCESS);
+    std::vector<float> output(16), reference(16);ggml_backend_tensor_get(yd,output.data(),0,output.size()*4);
+    if(decoded.ok()) {
+        for(size_t row=0;row<16;++row){reference[row]=ggml_fp16_to_fp32(decoded.value()[row*32+1].bits);}
+        accuracy(output,reference,"binary decode changed inputs");
+    }
+    CHECK(get_stats(backend.get(),&stats));CHECK(stats.preparations==2 && stats.executions==3 && stats.finalization_failures==0);
+    CHECK(ggml_backend_graph_compute(backend.get(),gp)==GGML_STATUS_FAILED);
+    CHECK(get_stats(backend.get(),&stats) && stats.preparations==2 && stats.executions==3);
+    backend.reset();
 }
 
 int main(int argc, char ** argv) {
     ggml_log_set(logger, nullptr);
     const char * app_write = std::getenv("GGML_QAIRT_APP_WRITE_WEIGHTS");
     const std::string saved_app_write = app_write ? app_write : "";
-    const char * sharing = std::getenv("GGML_QAIRT_SHARE_WEIGHT_GRAPHS");
-    const std::string saved_sharing = sharing ? sharing : "";
     _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "0");
-    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", "0");
     const char * old_target = std::getenv("GGML_QAIRT_DEVICE");
     const std::string saved_target = old_target ? old_target : "";
     _putenv_s("GGML_QAIRT_DEVICE", "HTP");
@@ -373,10 +468,8 @@ int main(int argc, char ** argv) {
     _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "1");
     _putenv_s("GGML_QAIRT_W4FP16", "1"); CHECK(!config_parser::from_environment().ok());
     _putenv_s("GGML_QAIRT_W4FP16", "0");
-    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", "1"); CHECK(config_parser::from_environment().ok());
-    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "0"); CHECK(!config_parser::from_environment().ok());
+    _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", "0"); CHECK(config_parser::from_environment().ok());
     _putenv_s("GGML_QAIRT_APP_WRITE_WEIGHTS", saved_app_write.c_str());
-    _putenv_s("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", saved_sharing.c_str());
     _putenv_s("GGML_QAIRT_W4FP16", saved_flag.c_str());
     _wputenv_s(L"GGML_QAIRT_LIBRARY_DIR", saved_directory.c_str());
     _putenv_s("GGML_QAIRT_DEVICE", saved_target.c_str());
@@ -392,6 +485,11 @@ int main(int argc, char ** argv) {
     }
     auto device = ggml_backend_dev_by_name("QAIRT0");
     CHECK(device != nullptr);
+    if (device && argc == 2 && (std::strcmp(argv[1],"--context-binaries") == 0 || std::strcmp(argv[1],"--context-binaries-corrupt") == 0)) {
+        context_binary_test(device,std::strcmp(argv[1],"--context-binaries-corrupt")==0);
+        std::printf("QAIRT context binaries: %d checks, %d failures\n",checks,failures);
+        return failures ? 1 : 0;
+    }
     if (device && argc == 2 && std::strcmp(argv[1],"--weight-reuse") == 0) {
         weight_reuse_test(device);
         std::printf("QAIRT APP_WRITE: %d checks, %d failures\n",checks,failures);

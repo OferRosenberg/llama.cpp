@@ -6,7 +6,7 @@ On November 19, 2026, the user accepted the FP16-emulated short/long results as 
 
 All local projection NMSE, relative-error, final-logit and greedy-token checks pass. The 15 short and 14 long absolute intermediate-error failures remain documented exceptions: FFN down-projection output, attention residual output and final residual output. Original numerical thresholds, measured results and test exit behavior remain unchanged. This is approval to progress with known accuracy exceptions, not a claim of universal model or device qualification.
 
-The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. By default, numerical QNN weights, activations, intermediates and outputs use FP16. Opt-in `GGML_QAIRT_W4FP16=1` uses native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs; see [runtime W4FP16 weights](QAIRT-w4fp16.md). Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
+The optional ggml-qairt backend uses the released QNN C API on Windows ARM64. By default, `GGML_QAIRT_W4FP16=1` uses native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs. Other weights use FP16. Set `GGML_QAIRT_W4FP16=0` for full-FP16 QNN execution; see [runtime W4FP16 weights](QAIRT-w4fp16.md). Current validation offloads all 27 numerical operations in Qwen3 block 27 plus final RMSNorm/scale. Builds and functional suites pass; original CPU model local/intermediate accuracy still fails unchanged acceptance gates.
 
 ## Build and runtime
 
@@ -22,7 +22,27 @@ ctest --test-dir C:\Github\qairt-qwen3-m2-arm64 -C Release -R '^qairt-' --output
 
 GGML_QAIRT defaults OFF. Disabled builds do not require the SDK. SDK headers remain private; provider libraries load from the configured absolute directory. Backend registration follows ordinary GGML static/shared/module integration. GGML_BACKEND_DL=ON requires BUILD_SHARED_LIBS=ON. Installed static packaging is not separately qualified.
 
-GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. GGML_QAIRT_W4FP16=0|1 enables upload-time weight repacking and native HTP W4FP16 MatMul; default 0, HTP V69+ required. Set before discovery/model loading. Invalid values fail configuration. Experimental `GGML_QAIRT_APP_WRITE_WEIGHTS=0|1` registers model weights as FP16 execution inputs. `GGML_QAIRT_SHARE_WEIGHT_GRAPHS=0|1` additionally shares structurally compatible graphs across weight allocations and requires APP_WRITE. Both default to 0 and are incompatible with native W4FP16; this HTP SDK requires STATIC BW_FLOAT_BLOCK weights. See [APP_WRITE graph reuse experiments](QAIRT-appwrite-graphs.md).
+GGML_QAIRT_DEVICE accepts HTP, GPU or CPU. Only HTP execution is enabled; GPU/CPU adapters remain disabled. Selection, library directory and capture failures are immutable after first process capture. GGML_QAIRT_PROFILE=0|1 enables basic profiling; GGML_QAIRT_DIAGNOSTICS=0|1 enables diagnostic detail. GGML_QAIRT_W4FP16=0|1 controls upload-time weight repacking and native HTP W4FP16 MatMul; default 1, HTP V69+ required. Set before discovery/model loading. Invalid values fail configuration. Experimental `GGML_QAIRT_APP_WRITE_WEIGHTS=0|1` registers model weights as FP16 execution inputs. APP_WRITE defaults to 0 and requires explicitly setting W4FP16 to 0; this HTP SDK requires STATIC BW_FLOAT_BLOCK weights. See [APP_WRITE graph reuse experiments](QAIRT-appwrite-graphs.md).
+
+`GGML_QAIRT_SHARED_CONTEXT=0|1` defaults to 1: ordinary cached graphs share one QNN context. Set 0 for one context per cached graph. Weight allocation identity remains in graph cache keys; graphs are not shared across different model weight buffers. Context-binary mode uses one context per phase regardless of this setting.
+
+### Runtime environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GGML_QAIRT_DEVICE` | `HTP` | Target selection; GPU and CPU execution remain disabled. |
+| `GGML_QAIRT_LIBRARY_DIR` | Unset; required | Absolute directory containing the QNN provider libraries. |
+| `GGML_QAIRT_W4FP16` | `1` | Repack eligible Q4_0/Q4_1 projection weights for native HTP W4FP16. |
+| `GGML_QAIRT_APP_WRITE_WEIGHTS` | `0` | Supply model weights as FP16 execution inputs; incompatible with W4FP16. |
+| `GGML_QAIRT_SHARED_CONTEXT` | `1` | Share one context among ordinary cached graphs; 0 creates a context per graph. |
+| `GGML_QAIRT_PROFILE` | `0` | Enable basic QNN profiling. |
+| `GGML_QAIRT_DIAGNOSTICS` | `0` | Enable backend diagnostic detail and QNN debug logging. |
+| `GGML_QAIRT_MEMORY_PROBE` | Unset; disabled | Inspect compiled memory metadata by serializing after each successful finalization; only 1 enables it. |
+| `GGML_QAIRT_DIAGNOSTIC_PHASE` | Unset | Label lifecycle diagnostics; decode0 and load_archives temporarily enable QNN DEBUG. |
+
+The first seven settings are captured once per process. Memory probing and diagnostic phase are read dynamically. Context-binary preparation requires memory probing to be disabled. The harness retains lifecycle/timing summaries. Automatic loading DEBUG logs, per-graph binary memory metadata, and graph-capture diagnostics require DIAGNOSTICS=1; an explicitly supplied diagnostic phase can also request backend tracing. Archive preparation restores the caller diagnostic phase and logging state on all exits.
+
+The QNN runtime also uses `ADSP_LIBRARY_PATH` to locate HTP skeleton libraries, and Windows uses `PATH` to locate dependent DLLs. Neither has a backend-defined default; configure the SDK directories as shown above. CMake options are build settings, not runtime environment variables.
 
 ## Admitted operation families
 
@@ -30,7 +50,7 @@ Support is bounded by shape, representation, precision, buffer and staging check
 
 | GGML operation | QNN HTP recipe |
 |---|---|
-| MUL_MAT, F32/F16 or admitted Q4_0/Q4_1 source weights | FP16 MatMul by default; opt-in W4FP16 supplies initialized STATIC signed-byte block weights for eligible Q4_0/Q4_1 projections |
+| MUL_MAT, F32/F16 or admitted Q4_0/Q4_1 source weights | W4FP16 supplies initialized STATIC signed-byte block weights for eligible Q4_0/Q4_1 projections by default; other admitted weights use FP16 MatMul |
 | Grouped/batched floating MUL_MAT | In-graph StridedSlice / rank-two MatMul per head / Concat with explicit KV-group mapping |
 | ADD / MUL | FP16 ElementWiseAdd / ElementWiseMultiply; admitted F32/F16 boundaries and singleton broadcasting |
 | RMS_NORM / NORM | RMSNorm / LayerNorm over final feature axis; flatten/factor independent rows into rank four |
@@ -147,6 +167,60 @@ Temporary per-tensor payload/address dumps, tensor topology dumps and per-node c
 
 Retain the host configuration/admission/packing tests, individual HTP operator tests, Q4_0/Q4_1 W4 tests, distinct-allocation APP_WRITE A/B/A/mutation tests and direct FP16 STATIC-versus-APP_WRITE test. Each covers a separate supported behavior. The mixed Q4_0 gate/up plus Q4_1 down FFN fixture additionally validates connected graph lowering and intermediate accuracy. Its actual-model M=1/M=23 CTests remain optional through `GGML_QAIRT_TEST_MODEL`; large full-model preparation probes and cancellation-stress fixtures are manual diagnostics.
 
-PD0 exhaustion remains a working hypothesis. Online graph finalization does not use the binary-deserialization PD selection path. Generating and loading context binaries is the next experiment, subject to the installed Windows driver's multi-PD support. No binary-loading or automatic context-rollover implementation is included in this checkpoint.
+PD0 exhaustion remains a working hypothesis. Online graph finalization does not use the binary-deserialization PD selection path. Generating and loading context binaries is the next experiment, subject to the installed Windows driver's multi-PD support. The context-binary experiment described below adds binary loading; automatic online context rollover remains unimplemented.
 
 Cleanup validation on November 22, 2026: ARM64 Release build succeeded; all 25 QAIRT CTests passed, including the optional actual-model FFN cases. A small shared-context APP_WRITE probe finalized three graphs, emitted exactly one memory-metadata row per graph, and passed all 323 checks with zero numerical error. This validates the diagnostic path, not the full-model PD-exhaustion hypothesis.
+
+## Prefill/decode context-binary experiment
+
+`test-qairt-model --context-binaries DIR --ctx 256 --fused --fp16-reference --offload-last all`
+prepares both phase archives before running the query. It requires one sequence, at most
+128 prompt tokens, and prompt plus requested decode positions within 256 KV entries.
+Flash Attention is disabled and the existing FP16 KV layout is preserved. Native W4FP16
+STATIC projection weights remain available through `GGML_QAIRT_W4FP16=1`.
+
+The harness builds and allocates a reserve graph for each phase, captures QAIRT scheduler
+splits, and reproduces the evaluation callback's block boundaries using only its metadata
+query. It does not execute a dummy prompt or read uninitialized dynamic inputs. Preparation
+uses ordinary lowering/finalization but stops before materialization and `graphExecute`.
+Each construction context is saved and explicitly freed before the next construction
+context is created. After both construction contexts are gone, their binaries are loaded
+with `contextCreateFromBinary`; graphs are retrieved and execution tensor IDs rebound by
+name. CPU embedding and output-head execution continues through the existing scheduler.
+
+The registry procedure `ggml_backend_qairt_archive` exposes backend-private lifecycle
+actions; QNN types remain private. The harness exports the existing internal
+`llama_context::graph_reserve` and `get_sched` methods for Windows DLL linking, without
+changing the public `llama.h` API. Loaded phase profiles are immutable: a miss fails and
+never compiles another graph during query execution. Archive loading checks SHA256,
+graph counts, I/O names, types, shapes and roles. Host recipes and digests remain in memory,
+so these files currently support a same-process experiment rather than standalone
+cross-process model-cache reuse. `manifest.txt` records the phase profile and graph counts.
+
+Binary loading uses the target context configuration and QNN default performance policy. No explicit BURST profile, voltage votes, sleep-latency override, or RPC control-latency override is applied. Graph switching retains the default zero memory-limit hint; graph initialization is not deferred and no subset of graphs is selected for loading.
+
+Each loaded context owns its separate STATIC weights. The 4 GiB logical STATIC cache
+budget applies separately to each active phase, not to combined host/device occupancy.
+Binary bytes remain alive for the loaded context lifetime. System metadata is copied
+before freeing the temporary System context and reports compiled-memory estimates,
+not actual free PD space. Binary-loading success alone does not prove multiple-PD use.
+
+Focused tests cover FP16 and native W4 round trips, changed dynamic inputs, rejected
+lifecycle order, immutable-profile misses, and corrupt-binary rejection. Full-model
+validation results must be recorded separately; these small fixtures do not establish
+all-block memory capacity or model accuracy.
+Context-binary validation on November 22, 2026: complete ARM64 Release build and all 28 QAIRT CTests passed. The all-28-block W4FP16 experiment compiled/saved/freed 28 prefill and 28 decode graphs, loaded both contexts, and completed 616 cached graph executions with zero runtime preparation. All 20 generated token choices matched the FP16-emulated CPU reference. The separate model harness nevertheless reported 3,522 failed numerical assertions. Retained diagnostics establish PD0 selection for the first loaded context; the second selection was not retained, so multi-PD use is unproven. See the external QAIRT_context_binaries_validation.md report for per-frame accuracy and all 56 graph-memory rows.
+
+With `--context-binaries`, the harness also prints `QNN timing` compilation/archive/
+combined-load records, `qairt: archive timing` binary-creation/release/per-phase-load
+records, and a separate `QNN throughput` replay after validation. Compilation includes
+lowering and finalization; the backend preparation/finalization counters are nested,
+not additive. Binary creation includes serialization, hashing and file writing;
+release is separate. Loading includes integrity/metadata checks and graph retrieval.
+
+TPS uses a warm replay of the same prompt and teacher-forced decode inputs with value
+observations and local CPU-reference comparisons disabled. Existing block boundaries,
+host conversions, CPU embedding/output-head execution and HTP operations are preserved.
+The throughput records require zero new preparations and the expected loaded-cache
+hit/execution count. Decode TPS measures processed single-token inputs and excludes
+sampling, compilation and loading. Existing numerical assertions and exit status remain.

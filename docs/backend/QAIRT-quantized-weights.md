@@ -1,6 +1,6 @@
 # Q4_0 weights with FP16 activations on QNN HTP
 
-> Implementation update (November 19, 2026): the optional runtime `GGML_QAIRT_W4FP16=1` path now implements initialization repacking and native MatMul lowering. Full FP16 remains the default. See [runtime W4FP16 weights](QAIRT-w4fp16.md). The research snapshot below preserves its original measurements and conclusions.
+> Implementation update (November 23, 2026): `GGML_QAIRT_W4FP16=1` is now the default, with initialization repacking and native MatMul lowering. Set the flag to 0 for full-FP16 QNN execution. See [runtime W4FP16 weights](QAIRT-w4fp16.md). The research snapshot below preserves its original measurements and conclusions.
 
 Research date: November 19, 2026. SDK: `2.52.0.261104`. Target: Windows ARM64, HTP V73. Model: `C:\Models\Qwen3-1.7B-Q4_0.gguf`. Production baseline: `baad4b7c1` (`M2 Full FP16`) on `Add-ggml-qairt-backedn`.
 

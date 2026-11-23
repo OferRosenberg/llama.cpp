@@ -74,13 +74,22 @@ struct prepared_run {
     std::unique_ptr<partition_data> partition;
 };
 
+struct phase_archive {
+    std::shared_ptr<context_owner> context;
+    std::vector<std::unique_ptr<prepared_run>> entries;
+    std::filesystem::path path;
+    std::string digest;
+    bool saved = false;
+};
+
 class backend_context final {
 public:
     explicit backend_context(std::shared_ptr<runtime_owner> runtime) : runtime_(std::move(runtime)) {}
     backend_context(const backend_context &) = delete;
     backend_context & operator=(const backend_context &) = delete;
     ggml_status compute(ggml_cgraph * graph);
-    void invalidate() noexcept { cache_.clear(); shared_context_.reset(); }
+    void invalidate() noexcept;
+    status archive(int action, ggml_cgraph * graph, const char * path);
     ggml_backend_qairt_stats stats() const noexcept { return stats_; }
 private:
     result<std::vector<fp16_bits>> pack(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
@@ -93,6 +102,11 @@ private:
     uint64_t next_graph_name_ = 0;
     std::vector<std::unique_ptr<prepared_run>> cache_;
     ggml_backend_qairt_stats stats_ {};
+    phase_archive archives_[2];
+    int archive_phase_ = -1;
+    bool archive_mode_ = false;
+    bool preparing_ = false;
+    bool archives_loaded_ = false;
 };
 
 }

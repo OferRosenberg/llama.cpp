@@ -1,9 +1,9 @@
 # QAIRT backend
 
-Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. Numerical QNN tensors are FP16 by default. Opt-in `GGML_QAIRT_W4FP16=1` supplies native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
+Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. By default, `GGML_QAIRT_W4FP16=1` supplies native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs. Set `GGML_QAIRT_W4FP16=0` for full-FP16 execution. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
 
 
-The registered ggml-qairt backend now supports expanded FP16 HTP recipes for projections, normalization/scales, residuals, SiLU/SwiGLU, RoPE, masked Softmax, grouped attention, Gather and KV ScatterNd. By default, numerical QNN tensors use FP16; index/control tensors use SDK-required integer types. GPU/CPU target policies remain architecturally present but disabled.
+The registered ggml-qairt backend now supports expanded FP16 HTP recipes for projections, normalization/scales, residuals, SiLU/SwiGLU, RoPE, masked Softmax, grouped attention, Gather and KV ScatterNd. Activations and outputs use FP16; eligible projection weights use native W4 by default and other weights use FP16. Index/control tensors use SDK-required integer types. GPU/CPU target policies remain architecturally present but disabled.
 
 See [runtime W4FP16 weights](../../../docs/backend/QAIRT-w4fp16.md) for initialization repacking, native tensor layout and qualification limits.
 
@@ -80,3 +80,5 @@ Validated against local llama.cpp commit `d90cfd4a9`, QAIRT SDK `2.52.0.261104`,
 The provider reported HTP architecture 73 and an unspecified SoC. SDK diagnostics reported failure of its traditional transport and some unsupported driver options/events, then selected the HTP user-driver path. Required MatMul and basic profile checks still passed. These results establish the tiny M0 fixture only; transformer graphs, GGUF quantization, KV state and complete profiling compatibility require later milestones.
 
 The complete build emitted existing compiler/build warnings and built without embedded Web UI assets. UI downloads were disabled for subsequent builds. No QAIRT source compilation error remains. M0 is recorded in local commit `05e54784b`. M1 adds the registered backend; see [current setup and support](../../../docs/backend/QAIRT.md).
+
+See [prefill/decode context archives](../../../docs/backend/QAIRT.md#prefilldecode-context-binary-experiment) for the experimental preparation/save/free/load lifecycle and its fixed-profile limits.
