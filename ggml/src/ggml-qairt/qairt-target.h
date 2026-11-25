@@ -15,6 +15,7 @@ struct runtime_config {
     bool app_write_weights = false;
     bool share_weight_graphs = false;
     bool shared_context = false;
+    bool validate_numerics = false;
     bool enable_profile = false;
     bool verbose_diagnostics = false;
 };

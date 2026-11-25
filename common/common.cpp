@@ -6,6 +6,7 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-cparams.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1429,6 +1430,51 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
+bool common_warmup_profile(llama_context * ctx, int32_t n_tokens) {
+    if (!ctx || n_tokens <= 0 || uint32_t(n_tokens) > llama_n_batch(ctx) ||
+        uint32_t(n_tokens) > llama_n_ubatch(ctx) || uint32_t(n_tokens) >= llama_n_ctx_seq(ctx)) {
+        COM_ERR("%s", "warmup profile must fit one microbatch and leave room for decode\n");
+        return false;
+    }
+    const auto * model = llama_get_model(ctx);
+    auto memory = llama_get_memory(ctx);
+    if (!memory || llama_model_has_encoder(model) || !llama_model_has_decoder(model)) {
+        COM_ERR("%s", "warmup profiles require a decoder-only model with memory\n");
+        return false;
+    }
+    // Sequence IDs can lie outside the count of concurrent sequences.
+    for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+        if (llama_memory_seq_pos_max(memory, seq) >= 0) {
+            COM_ERR("%s", "warmup profile requires empty memory\n");
+            return false;
+        }
+    }
+    const auto * vocab = llama_model_get_vocab(model);
+    llama_token token = llama_vocab_bos(vocab);
+    if (token == LLAMA_TOKEN_NULL) { token = llama_vocab_eos(vocab); }
+    if (token == LLAMA_TOKEN_NULL) { token = 0; }
+    const auto start = ggml_time_us();
+    common_batch prefill = common_batch_get_one(ctx, llama_tokens(size_t(n_tokens), token));
+    const int prefill_status = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, prefill.get());
+    llama_synchronize(ctx);
+    const auto prefill_end = ggml_time_us();
+    int decode_status = -1;
+    if (prefill_status == 0) {
+        common_batch decode = common_batch_get_one(ctx, &token, 1);
+        decode_status = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, decode.get());
+        llama_synchronize(ctx);
+    }
+    const auto decode_end = ggml_time_us();
+    llama_memory_clear(memory, true);
+    llama_perf_context_reset(ctx);
+    if (prefill_status != 0 || decode_status != 0) {
+        COM_ERR("warmup profile failed: prefill=%d decode=%d\n", prefill_status, decode_status);
+        return false;
+    }
+    COM_INF("initialization profile: prefill %d tokens %.2f ms, decode 1 token %.2f ms (preparation and execution)\n",
+            n_tokens, (prefill_end - start) / 1000.0, (decode_end - prefill_end) / 1000.0);
+    return true;
+}
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1504,7 +1550,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    if (params.warmup && params.warmup_batch_size > 0) {
+        if (!common_warmup_profile(lctx, params.warmup_batch_size)) {
+            throw std::runtime_error("failed to prepare initialization profile");
+        }
+        res->reset_samplers();
+    } else if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;

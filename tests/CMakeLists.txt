@@ -350,6 +350,8 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-warmup-profile.cpp LABEL behavior)
+target_include_directories(test-warmup-profile PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -415,8 +417,12 @@ if (GGML_QAIRT AND GGML_QAIRT_TESTS)
     set_tests_properties(qairt-m1-cpu-disabled PROPERTIES
         ENVIRONMENT "GGML_QAIRT_DEVICE=CPU;GGML_QAIRT_LIBRARY_DIR=C:/QNN-unused")
     if (GGML_QAIRT_HW_TESTS)
+        llama_test(test-qairt NAME qairt-native-runtime-htp LABEL hardware ARGS --runtime-path)
+        set_tests_properties(qairt-native-runtime-htp PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "GGML_QAIRT_VALIDATE=0")
         llama_test(test-qairt NAME qairt-m1-htp LABEL hardware)
         llama_test(test-qairt-fp16 NAME qairt-m2-fp16-htp LABEL hardware)
+        set_tests_properties(qairt-m1-htp PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "GGML_QAIRT_VALIDATE=1")
+        set_tests_properties(qairt-m2-fp16-htp PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "GGML_QAIRT_VALIDATE=1;GGML_QAIRT_W4FP16=0;GGML_QAIRT_APP_WRITE_WEIGHTS=0;GGML_QAIRT_SHARE_WEIGHT_GRAPHS=0")
         foreach(share RANGE 0 1)
             llama_test(test-qairt-fp16 NAME qairt-appwrite-share${share}-htp LABEL hardware ARGS --weight-reuse)
             set_tests_properties(qairt-appwrite-share${share}-htp PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "GGML_QAIRT_W4FP16=0;GGML_QAIRT_APP_WRITE_WEIGHTS=1;GGML_QAIRT_SHARE_WEIGHT_GRAPHS=${share}")

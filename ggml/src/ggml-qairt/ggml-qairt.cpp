@@ -204,7 +204,7 @@ bool buffer_host(ggml_backend_buffer_type_t buft) {
 }
 ggml_backend_buffer_type_t device_buft(ggml_backend_dev_t dev) { return &static_cast<registry_context *>(dev->context)->buft; }
 bool device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return buft && (buft->iface.get_name == buffer_type_name || ggml_backend_buft_is_host(buft));
+    return buft && buft->iface.get_name == buffer_type_name;
 }
 bool device_supports_op(ggml_backend_dev_t, const ggml_tensor * t) {
     try {
@@ -223,11 +223,14 @@ void backend_free(ggml_backend_t backend) {
 void backend_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     const int count = ggml_graph_n_nodes(graph);
     if (!params || !params->add_alloc_dep || count == 0) { return; }
-    auto * last = ggml_graph_node(graph, count-1);
+    int last_index = count - 1;
+    while (last_index >= 0 && !(ggml_graph_node(graph, last_index)->flags & GGML_TENSOR_FLAG_COMPUTE)) { --last_index; }
+    if (last_index < 0) { return; }
+    auto * last = ggml_graph_node(graph, last_index);
     // QNN writes the readable GGML outputs together at partition completion.
-    for (int i = 0; i + 1 < count; ++i) {
+    for (int i = 0; i < last_index; ++i) {
         auto * node = ggml_graph_node(graph, i);
-        if (!metadata_op(node->op)) { params->add_alloc_dep(params->user_data,node,last); }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) && !metadata_op(node->op)) { params->add_alloc_dep(params->user_data,node,last); }
     }
 }
 enum ggml_status backend_compute(ggml_backend_t backend, ggml_cgraph * graph) {

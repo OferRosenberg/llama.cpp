@@ -118,6 +118,7 @@ static void matmul_tests(ggml_backend_t backend, enum ggml_type weight_type, enu
     ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     auto * a = ggml_new_tensor_2d(c, activation_type, 4, 2);
     auto * y = ggml_mul_mat(c, w, a);
+    ggml_set_output(y);
     auto * bias = ggml_new_tensor_2d(c, GGML_TYPE_F16, 3, 1);
     auto * cast = ggml_cast(c, y, GGML_TYPE_F16);
     auto * z = ggml_add(c, cast, bias);
@@ -238,6 +239,225 @@ static void placement_test(ggml_backend_t qairt) {
     ggml_backend_free(cpu);
     ggml_free(c);
 }
+static void partition_dispatch_test(ggml_backend_t backend) {
+    auto get_stats = reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_qairt_get_stats"));
+    CHECK(get_stats != nullptr);
+    if (!get_stats) { return; }
+    for (bool inactive_branch : {false, true}) {
+        auto * c = context();
+        auto * input = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+        auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+        auto * poison = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+        auto * output = ggml_add(c, input, increment);
+        auto * graph = ggml_new_graph(c);
+        if (inactive_branch) {
+            output = ggml_add(c, output, increment);
+            ggml_tensor * branches[] = {output, ggml_dup(c, poison)};
+            CHECK(ggml_build_forward_select(graph, branches, 2, 0) == output);
+        } else {
+            ggml_build_forward_expand(graph, output);
+        }
+        auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+        CHECK(buffer != nullptr);
+        if (buffer) {
+            upload(input, std::vector<float>(32, 0.25f));
+            upload(increment, std::vector<float>(32, 0.125f));
+            upload(poison, std::vector<float>(32, std::numeric_limits<float>::quiet_NaN()));
+            ggml_backend_qairt_stats before {}, after {};
+            CHECK(get_stats(backend, &before));
+            const auto status = ggml_backend_graph_compute(backend, graph);
+            CHECK(status == GGML_STATUS_SUCCESS);
+            CHECK(get_stats(backend, &after));
+            const uint64_t qnn_runs = inactive_branch ? 1 : 0;
+            CHECK(after.preparations == before.preparations + qnn_runs);
+            CHECK(after.executions == before.executions + qnn_runs);
+            if (status == GGML_STATUS_SUCCESS) {
+                expect(output, std::vector<float>(32, inactive_branch ? 0.5f : 0.375f), 0);
+            }
+            ggml_backend_buffer_free(buffer);
+        }
+        ggml_free(c);
+    }
+}
+
+static void runtime_path_test(ggml_backend_t backend) {
+    CHECK(!ggml_backend_supports_buft(backend, ggml_backend_cpu_buffer_type()));
+    auto get_stats = reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_qairt_get_stats"));
+    CHECK(get_stats != nullptr);
+    if (!get_stats) { return; }
+    for (int length : {129, 160}) {
+        auto * c = context();
+        auto * input = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+        auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+        auto * output = input;
+        for (int i = 0; i < length; ++i) { output = ggml_add(c, output, increment); }
+        auto * graph = ggml_new_graph_custom(c, 1024, false);
+        ggml_build_forward_expand(graph, output);
+        auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+        CHECK(buffer != nullptr);
+        if (buffer) {
+            upload(input, std::vector<float>(32, 0.25f));
+            upload(increment, std::vector<float>(32, 0.125f));
+            ggml_backend_qairt_stats before {}, after {};
+            CHECK(get_stats(backend, &before));
+            const auto status = ggml_backend_graph_compute(backend, graph);
+            CHECK(status == GGML_STATUS_SUCCESS);
+            CHECK(get_stats(backend, &after));
+            // The second chain reuses the first 128-Add graph.
+            CHECK(after.preparations == before.preparations + 1);
+            CHECK(after.executions == before.executions + (length == 129 ? 1 : 2));
+            CHECK(after.exported_tensors - before.exported_tensors == (length == 129 ? 1 : 2));
+            CHECK(after.materialized_outputs - before.materialized_outputs == 1);
+            CHECK(after.fp16_handoffs - before.fp16_handoffs == (length == 129 ? 0 : 1));
+            if (status == GGML_STATUS_SUCCESS) { expect(output, std::vector<float>(32, 0.25f + length * 0.125f), 0); }
+            ggml_backend_buffer_free(buffer);
+        }
+        ggml_free(c);
+    }
+}
+
+static void boundary_alias_test(ggml_backend_t backend) {
+    auto get_stats = reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_qairt_get_stats"));
+    CHECK(get_stats != nullptr); if (!get_stats) { return; }
+    auto * c = context();
+    auto * input = ggml_new_tensor_2d(c, GGML_TYPE_F32, 4, 8);
+    auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1);
+    auto * output = input;
+    ggml_tensor * observed = nullptr;
+    for (int i = 0; i < 128; ++i) {
+        output = ggml_add(c, output, increment);
+        if (i == 63) { observed = output; ggml_set_output(observed); }
+    }
+    output = ggml_cont(c, ggml_transpose(c, output));
+    for (int i = 0; i < 32; ++i) { output = ggml_add(c, output, increment); }
+    auto * graph = ggml_new_graph_custom(c, 1024, false);
+    ggml_build_forward_expand(graph, output);
+    auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+    CHECK(buffer != nullptr);
+    if (buffer) {
+        upload(increment, {0.125f});
+        for (float start : {0.25f, 1.25f}) {
+            std::vector<float> values(32), expected(32);
+            for (size_t i = 0; i < values.size(); ++i) { values[i] = start + i / 16.0f; }
+            upload(input, values);
+            ggml_backend_qairt_stats before {}, after {};
+            CHECK(get_stats(backend, &before));
+            CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            CHECK(get_stats(backend, &after));
+            CHECK(after.exported_tensors - before.exported_tensors == 3);
+            CHECK(after.materialized_outputs - before.materialized_outputs == 2);
+            for (size_t i = 0; i < values.size(); ++i) { expected[i] = values[i] + 8.0f; }
+            expect(observed, expected, 0);
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t col = 0; col < 8; ++col) { expected[row * 8 + col] = values[col * 4 + row] + 20.0f; }
+            }
+            expect(output, expected, 0);
+        }
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(c);
+}
+static void boundary_observation_test(ggml_backend_t backend) {
+    auto get_stats = reinterpret_cast<ggml_backend_qairt_get_stats_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_qairt_get_stats"));
+    CHECK(get_stats != nullptr); if (!get_stats) { return; }
+    auto * c = context();
+    auto * input = ggml_new_tensor_1d(c, GGML_TYPE_F32, 32);
+    auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F32, 32);
+    auto * observed = ggml_add(c, input, increment);
+    auto * output = ggml_add(c, ggml_add(c, observed, increment), increment);
+    auto * graph = ggml_new_graph(c); ggml_build_forward_expand(graph, output);
+    auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+    CHECK(buffer != nullptr);
+    if (buffer) {
+        upload(input, std::vector<float>(32, 0.25f)); upload(increment, std::vector<float>(32, 0.125f));
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        expect(output, std::vector<float>(32, 0.625f), 0);
+        ggml_backend_qairt_stats before {}, after {};
+        CHECK(get_stats(backend, &before));
+        ggml_set_output(observed);
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        CHECK(get_stats(backend, &after));
+        CHECK(after.preparations == before.preparations + 1);
+        CHECK(after.exported_tensors == before.exported_tensors + 2);
+        expect(observed, std::vector<float>(32, 0.375f), 0);
+        expect(output, std::vector<float>(32, 0.625f), 0);
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(c);
+}
+static void boundary_reuse_test(ggml_backend_t backend) {
+    auto * c = context();
+    auto * input = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+    auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F16, 32);
+    auto * output = input;
+    ggml_tensor * skip = nullptr;
+    for (int i = 0; i < 544; ++i) {
+        output = ggml_add(c, output, increment);
+        if (i == 127) { skip = output; }
+    }
+    output = ggml_add(c, output, skip);
+    auto * graph = ggml_new_graph_custom(c, 1024, false); ggml_build_forward_expand(graph, output);
+    auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+    CHECK(buffer != nullptr);
+    if (buffer) {
+        upload(input, std::vector<float>(32, 0.25f));
+        upload(increment, std::vector<float>(32, 0.125f));
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        expect(output, std::vector<float>(32, 84.5f), 0);
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(c);
+}
+static void boundary_scheduler_test(ggml_backend_t backend) {
+    auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr); if (!cpu) { return; }
+    auto * c = context();
+    auto * input = ggml_new_tensor_1d(c, GGML_TYPE_F32, 32);
+    auto * increment = ggml_new_tensor_1d(c, GGML_TYPE_F32, 32);
+    auto * hybrid = ggml_add(c, ggml_add(c, input, increment), increment);
+    auto * output = ggml_sqr(c, hybrid);
+    auto * graph = ggml_new_graph(c); ggml_build_forward_expand(graph, output);
+    ggml_backend_t backends[] = {backend, cpu};
+    auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+    CHECK(scheduler != nullptr);
+    if (scheduler) {
+        ggml_backend_sched_set_tensor_backend(scheduler, hybrid, backend);
+        CHECK(ggml_backend_sched_alloc_graph(scheduler, graph));
+        upload(input, std::vector<float>(32, 0.25f));
+        upload(increment, std::vector<float>(32, 0.125f));
+        CHECK(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+        expect(output, std::vector<float>(32, 0.25f), 0);
+        ggml_backend_sched_free(scheduler);
+    }
+    ggml_backend_free(cpu); ggml_free(c);
+}
+
+static void grouped_runtime_test(ggml_backend_t backend) {
+    auto * c = context();
+    auto * weights = ggml_new_tensor_3d(c, GGML_TYPE_F16, 2, 2, 8);
+    auto * input = ggml_new_tensor_3d(c, GGML_TYPE_F32, 2, 2, 16);
+    auto * output = input;
+    for (int i = 0; i < 32; ++i) { output = ggml_mul_mat(c, weights, output); }
+    auto * graph = ggml_new_graph_custom(c, 1024, false);
+    ggml_build_forward_expand(graph, output);
+    auto buffer = ggml_backend_alloc_ctx_tensors(c, backend);
+    CHECK(buffer != nullptr);
+    if (buffer) {
+        std::vector<float> identity(32, 0.0f);
+        for (size_t i = 0; i < identity.size(); i += 4) { identity[i] = identity[i + 3] = 1.0f; }
+        upload(weights, identity);
+        upload(input, std::vector<float>(64, 0.5f));
+        const auto status = ggml_backend_graph_compute(backend, graph);
+        CHECK(status == GGML_STATUS_SUCCESS);
+        if (status == GGML_STATUS_SUCCESS) { expect(output, std::vector<float>(64, 0.5f), 0); }
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(c);
+}
 int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--m2-host") == 0) { m2_host_tests(); }
     else if (argc == 2 && std::strcmp(argv[1], "--host") == 0) { host_tests(); }
@@ -250,6 +470,12 @@ int main(int argc, char ** argv) {
             auto backend = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
             CHECK(backend != nullptr);
             if (backend) {
+                if (argc == 2 && std::strcmp(argv[1], "--runtime-path") == 0) {
+                    partition_dispatch_test(backend); runtime_path_test(backend); boundary_alias_test(backend); boundary_observation_test(backend); boundary_reuse_test(backend); boundary_scheduler_test(backend); grouped_runtime_test(backend);
+                    ggml_backend_free(backend);
+                    std::printf("QAIRT native runtime: %d checks, %d failures\n", checks, failures);
+                    return failures ? 1 : 0;
+                }
                 buffer_tests(backend); transposed_matmul_test(backend);
                 primitive_tests(backend, GGML_TYPE_F16);
                 matmul_tests(backend, GGML_TYPE_F16); matmul_tests(backend, GGML_TYPE_F32);

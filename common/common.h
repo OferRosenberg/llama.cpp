@@ -598,6 +598,7 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool warmup            = true;  // warmup run
+    int32_t warmup_batch_size = 0;  // prefill profile tokens, 0 keeps the legacy warmup
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
@@ -1024,6 +1025,9 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// Prepare one prefill/decode profile in an empty decoder context; preserve backend caches and clear warmup state.
+bool common_warmup_profile(struct llama_context * ctx, int32_t n_tokens);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

@@ -32,8 +32,10 @@ bool readable_tensor(const ggml_tensor * tensor) noexcept;
 
 struct pending_output {
     ggml_tensor * tensor;
-    std::vector<uint8_t> bytes;
+    std::shared_ptr<std::vector<fp16_bits>> values;
 };
+bool pending_alias(const ggml_tensor * tensor, const std::vector<pending_output> & pending);
+const fp16_bits * retained_fp16(const ggml_tensor * tensor, const std::vector<pending_output> & pending);
 struct boundary_input {
     size_t node;
     size_t source;
@@ -62,6 +64,8 @@ struct partition_data {
     std::vector<size_t> output_nodes;
     std::vector<partition_rope> ropes;
     std::vector<partition_span> spans;
+    std::vector<std::vector<uint8_t>> input_buffers;
+    std::vector<std::shared_ptr<std::vector<fp16_bits>>> output_buffers;
     size_t qnn_nodes = 0;
     size_t w4_matmuls = 0;
 };
@@ -77,6 +81,7 @@ struct prepared_run {
 class backend_context final {
 public:
     explicit backend_context(std::shared_ptr<runtime_owner> runtime) : runtime_(std::move(runtime)) {}
+    ~backend_context();
     backend_context(const backend_context &) = delete;
     backend_context & operator=(const backend_context &) = delete;
     ggml_status compute(ggml_cgraph * graph);
@@ -84,10 +89,12 @@ public:
     ggml_backend_qairt_stats stats() const noexcept { return stats_; }
 private:
     result<std::vector<fp16_bits>> pack(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
+    result<std::vector<uint8_t>> numerical_bytes(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
     result<std::vector<uint8_t>> mask_bytes(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
     result<std::vector<float>> float_parameters(const ggml_tensor * tensor, const std::vector<pending_output> & pending) const;
-    status run_partition(const std::vector<ggml_tensor *> & nodes, std::vector<pending_output> & pending);
+    status run_partition(const std::vector<ggml_tensor *> & nodes, const std::vector<bool> & exports, std::vector<pending_output> & pending);
     bool reserve_cache(size_t additional, const prepared_run * keep = nullptr);
+    ggml_backend_t cpu_backend_ = nullptr;
     std::shared_ptr<runtime_owner> runtime_;
     std::shared_ptr<context_owner> shared_context_;
     uint64_t next_graph_name_ = 0;

@@ -1,15 +1,10 @@
 #include "qairt-graph.h"
-#include "ggml-impl.h"
 
 #include <limits>
 #include <cmath>
 #include <QnnOpDef.h>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <stdexcept>
-#include <System/QnnSystemInterface.h>
-#include <HTP/QnnHtpSystemContext.h>
 
 namespace ggml::qairt {
 
@@ -59,12 +54,6 @@ result<std::shared_ptr<graph_owner>> graph_owner::create(std::shared_ptr<context
     });
     if (code != QNN_SUCCESS) { graph->graph_ = nullptr; return graph_result::failure(sdk_error(error_stage::graph_create, "graphCreate", code)); }
     graph->context_ = std::move(context);
-    static std::atomic<uint64_t> sequence {0};
-    graph->diagnostic_id_ = ++sequence;
-    if (diagnostic_phase()) {
-        GGML_LOG_INFO("qairt: inventory graph_create phase=%s graph=%llu context=%p handle=%p\n", diagnostic_phase(),
-            (unsigned long long) graph->diagnostic_id_, graph->context_->handle(), graph->graph_);
-    }
     ++graph->context_->active_graphs_;
     return graph_result::success(std::move(graph));
 }
@@ -540,80 +529,10 @@ status graph_owner::add_node(const op_spec & spec) {
     return status::success();
 }
 
-static void measure_compiled_memory(const std::shared_ptr<context_owner> & context, uint64_t graph_id, const std::string & graph_name) {
-    const char * enabled = std::getenv("GGML_QAIRT_MEMORY_PROBE");
-    if (!enabled || std::strcmp(enabled, "1") != 0) { return; }
-    try {
-        const auto runtime = context->runtime();
-        auto loaded = dll_module::load(runtime->config().library_directory / "QnnSystem.dll");
-        if (!loaded.ok()) { throw std::runtime_error("QnnSystem.dll load failed"); }
-        const auto module = loaded.value();
-        auto resolved = module->resolve<decltype(&QnnSystemInterface_getProviders)>("QnnSystemInterface_getProviders");
-        if (!resolved.ok()) { throw std::runtime_error("System provider resolution failed"); }
-        const QnnSystemInterface_t ** providers = nullptr;
-        uint32_t count = 0;
-        if (resolved.value()(&providers, &count) != QNN_SUCCESS || !count) { throw std::runtime_error("No System provider"); }
-        if (!providers || !providers[0]) { throw std::runtime_error("Invalid System provider"); }
-        const auto & system = providers[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
-        if (!system.systemContextCreate || !system.systemContextGetBinaryInfo || !system.systemContextFree) { throw std::runtime_error("Missing System metadata functions"); }
-        Qnn_ContextBinarySize_t size = 0, written = 0;
-        auto code = runtime->domain()->call([&](const auto & api) { return api.contextGetBinarySize ? api.contextGetBinarySize(context->handle(), &size) : QNN_COMMON_ERROR_NOT_SUPPORTED; });
-        if (code != QNN_SUCCESS || !size) { throw std::runtime_error("contextGetBinarySize failed"); }
-        std::vector<uint8_t> binary(size);
-        code = runtime->domain()->call([&](const auto & api) { return api.contextGetBinary ? api.contextGetBinary(context->handle(), binary.data(), size, &written) : QNN_COMMON_ERROR_NOT_SUPPORTED; });
-        if (code != QNN_SUCCESS || !written || written > size) { throw std::runtime_error("contextGetBinary failed"); }
-        QnnSystemContext_Handle_t handle = nullptr;
-        if (system.systemContextCreate(&handle) != QNN_SUCCESS) { throw std::runtime_error("systemContextCreate failed"); }
-        const QnnSystemContext_BinaryInfo_t * info = nullptr;
-        Qnn_ContextBinarySize_t info_size = 0;
-        code = system.systemContextGetBinaryInfo(handle, binary.data(), written, &info, &info_size);
-        if (code == QNN_SUCCESS && info) {
-            GGML_LOG_INFO("qairt: inventory memory_probe graph=%llu serialized_bytes=%llu binary_version=%u\n",
-                (unsigned long long) graph_id, (unsigned long long) written, (unsigned) info->version);
-            if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
-                const auto & details = info->contextBinaryInfoV3;
-                for (uint32_t i = 0; i < details.numGraphs; ++i) {
-                    const auto & graph = details.graphs[i];
-                    if (graph.version != QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) { continue; }
-                    const auto & graph_info = graph.graphInfoV3;
-                    if (!graph_info.graphName || graph_name != graph_info.graphName) { continue; }
-                    if (graph_info.graphBlobInfoSize < sizeof(QnnHtpSystemContext_GraphBlobInfo_t) + sizeof(QnnHtpSystemContext_GraphBlobInfoV2_t) || !graph_info.graphBlobInfo) { continue; }
-                    QnnHtpSystemContext_GraphBlobInfo_t settings {};
-                    QnnHtpSystemContext_GraphBlobInfoV2_t memory {};
-                    std::memcpy(&settings, graph_info.graphBlobInfo, sizeof(settings));
-                    // SDK stores V2 metadata after the V1 graph settings.
-                    std::memcpy(&memory, static_cast<const uint8_t *>(graph_info.graphBlobInfo) + sizeof(settings), sizeof(memory));
-                    GGML_LOG_INFO("qairt: inventory memory_probe graph=%llu spill_fill_bytes=%llu\n", (unsigned long long) graph_id, (unsigned long long) settings.contextBinaryGraphBlobInfoV1.spillFillBufferSize);
-                    if (memory.version != QNN_SYSTEM_CONTEXT_HTP_GRAPH_INFO_BLOB_VERSION_V2) { continue; }
-                    GGML_LOG_INFO("qairt: inventory memory_probe graph=%llu metadata_index=%u graph_name=%s opdata_bytes=%llu const_bytes=%llu ddr_tensor_bytes=%llu shared_weights_bytes=%llu io_bytes=%llu\n",
-                        (unsigned long long) graph_id, i, graph_info.graphName ? graph_info.graphName : "unknown", (unsigned long long) memory.opDataSize, (unsigned long long) memory.constSize,
-                        (unsigned long long) memory.ddrTensorSize, (unsigned long long) memory.sharedWeightsSize, (unsigned long long) memory.ioTensorSize);
-                }
-            }
-        } else { GGML_LOG_WARN("qairt: inventory memory_probe metadata_error=%llu\n", (unsigned long long) code); }
-        system.systemContextFree(handle);
-    } catch (const std::exception & error) { GGML_LOG_WARN("qairt: inventory memory_probe unavailable: %s\n", error.what()); }
-}
-
 status graph_owner::finalize() {
     if (state_ != graph_state::building || !node_added_) { return status::failure(host_error(error_stage::graph_finalize, "graphFinalize", "Graph needs its primitive node")); }
     auto runtime = context_->runtime();
-    if (diagnostic_phase()) {
-        size_t counts[4] {}, sizes[4] {};
-        for (const auto & tensor : tensors_) {
-            const auto role = tensor->spec().role;
-            const size_t slot = role == QNN_TENSOR_TYPE_STATIC ? 0 : role == QNN_TENSOR_TYPE_APP_WRITE ? 1 : role == QNN_TENSOR_TYPE_APP_READ ? 2 : 3;
-            ++counts[slot]; sizes[slot] += tensor->required_bytes().value();
-        }
-        GGML_LOG_INFO("qairt: inventory finalize_begin phase=%s graph=%llu static_count=%zu static_bytes=%zu input_count=%zu input_bytes=%zu output_count=%zu output_bytes=%zu native_count=%zu native_logical_bytes=%zu\n",
-            diagnostic_phase(), (unsigned long long) diagnostic_id_, counts[0], sizes[0], counts[1], sizes[1], counts[2], sizes[2], counts[3], sizes[3]);
-    }
     auto code = runtime->domain()->call([&](const auto & api) { return api.graphFinalize(graph_, runtime->profile(), nullptr); });
-    if (diagnostic_phase()) {
-        GGML_LOG_INFO("qairt: inventory finalize_end phase=%s graph=%llu code=%llu\n", diagnostic_phase(),
-            (unsigned long long) diagnostic_id_, (unsigned long long) code);
-    }
-    if (code == QNN_SUCCESS) { measure_compiled_memory(context_, diagnostic_id_, name_); }
     state_ = code == QNN_SUCCESS ? graph_state::finalized : graph_state::failed;
     return check_qnn(code, error_stage::graph_finalize, "graphFinalize");
 }

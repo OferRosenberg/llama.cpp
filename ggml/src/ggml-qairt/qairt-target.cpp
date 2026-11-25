@@ -64,6 +64,7 @@ result<runtime_config> config_parser::from_environment() {
     if (directory) { config.library_directory = directory; }
     for (const auto & option : { std::make_pair("GGML_QAIRT_PROFILE", &config.enable_profile),
                                 std::make_pair("GGML_QAIRT_DIAGNOSTICS", &config.verbose_diagnostics),
+                                std::make_pair("GGML_QAIRT_VALIDATE", &config.validate_numerics),
                                 std::make_pair("GGML_QAIRT_W4FP16", &config.enable_w4fp16),
                                 std::make_pair("GGML_QAIRT_APP_WRITE_WEIGHTS", &config.app_write_weights),
                                 std::make_pair("GGML_QAIRT_SHARE_WEIGHT_GRAPHS", &config.share_weight_graphs),

@@ -23,7 +23,7 @@ static int failures = 0, checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
 static context_ptr context() { return {ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free}; }
 static void logger(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "qairt: inventory")) { std::fputs(text, stderr); }
+    if (level == GGML_LOG_LEVEL_ERROR) { std::fputs(text, stderr); }
 }
 static void packing_tests() {
     std::vector<uint8_t> raw(18 * 2);
@@ -126,7 +126,7 @@ static std::vector<float> cpu_product(ggml_backend_t cpu, ggml_tensor * weights,
     auto c = context();
     auto * y = ggml_mul_mat(c.get(), weights, input);
     y->flags |= GGML_TENSOR_FLAG_COMPUTE;
-    auto * graph = ggml_new_graph(c.get()); ggml_graph_add_node(graph, y);
+    auto * graph = ggml_new_graph(c.get()); ggml_build_forward_expand(graph, y);
     buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(c.get(), cpu), ggml_backend_buffer_free);
     CHECK(buffer != nullptr);
     if (!buffer || ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) { CHECK(false); return {}; }
@@ -151,7 +151,7 @@ static void projection_test(ggml_backend_dev_t device, size_t width, size_t outp
     backend_ptr backend(ggml_backend_dev_init(device, nullptr), ggml_backend_free);
     backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), ggml_backend_free);
     CHECK(backend && cpu); if (!backend || !cpu) { return; }
-    CHECK(ggml_backend_supports_buft(backend.get(), ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu.get()))));
+    CHECK(!ggml_backend_supports_buft(backend.get(), ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu.get()))));
     auto wc = context(), c = context(), pc = context();
     auto * w = ggml_new_tensor_2d(wc.get(), GGML_TYPE_Q4_0, int64_t(width), int64_t(outputs));
     buffer_ptr wb(ggml_backend_alloc_ctx_tensors(wc.get(), backend.get()), ggml_backend_buffer_free);
@@ -164,9 +164,9 @@ static void projection_test(ggml_backend_dev_t device, size_t width, size_t outp
     original_weights.clear(); original_weights.shrink_to_fit();
     ggml_backend_tensor_set(w, packed_weights.data(), 0, packed_weights.size());
     auto * x = ggml_new_tensor_2d(c.get(), GGML_TYPE_F32, int64_t(width), int64_t(rows));
-    auto * y = ggml_mul_mat(c.get(), w, x);
-    auto * graph = ggml_new_graph(c.get()); ggml_graph_add_node(graph, y);
-    if (width == 32) { ggml_graph_add_node(graph, ggml_reshape_3d(c.get(), y, 4, int64_t(outputs / 4), int64_t(rows))); }
+    auto * y = ggml_dup(c.get(), ggml_mul_mat(c.get(), w, x));
+    auto * graph = ggml_new_graph(c.get()); ggml_build_forward_expand(graph, y);
+    if (width == 32) { ggml_build_forward_expand(graph, ggml_reshape_3d(c.get(), y, 4, int64_t(outputs / 4), int64_t(rows))); }
     buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(c.get(), backend.get()), ggml_backend_buffer_free);
     CHECK(buffer && ggml_backend_supports_op(backend.get(), y)); if (!buffer) { return; }
     auto * fw = ggml_new_tensor_2d(pc.get(), GGML_TYPE_F16, int64_t(width), int64_t(outputs));
@@ -218,8 +218,8 @@ static void fp16_activation_test(ggml_backend_dev_t device) {
     auto c = context();
     auto * w = ggml_new_tensor_2d(c.get(), GGML_TYPE_Q4_0, 32, 1);
     auto * x = ggml_new_tensor_2d(c.get(), GGML_TYPE_F32, 32, 1);
-    auto * y = ggml_mul_mat(c.get(), w, x);
-    auto * graph = ggml_new_graph(c.get()); ggml_graph_add_node(graph, y);
+    auto * y = ggml_dup(c.get(), ggml_mul_mat(c.get(), w, x));
+    auto * graph = ggml_new_graph(c.get()); ggml_build_forward_expand(graph, y);
     buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(c.get(), backend.get()), ggml_backend_buffer_free);
     CHECK(buffer); if (!buffer) { return; }
     std::vector<float> weights(32, 0), input(32, 0);
@@ -261,11 +261,11 @@ static void w4_backend_test(ggml_backend_dev_t device, ggml_type type = GGML_TYP
     ggml_backend_tensor_set(w,raw.data()+raw.size()/2,raw.size()/2,raw.size()/2);
     ggml_backend_tensor_set(w,raw.data(),0,raw.size()/2);
     auto * x = ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,32);
-    auto * y = ggml_mul_mat(c.get(),w,x);
-    auto * graph = ggml_new_graph(c.get()); ggml_graph_add_node(graph,y);
+    auto * y = ggml_dup(c.get(),ggml_mul_mat(c.get(),w,x));
+    auto * graph = ggml_new_graph(c.get()); ggml_build_forward_expand(graph,y);
     auto * x2 = ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,1);
-    auto * y2 = ggml_mul_mat(c.get(),w,x2);
-    auto * graph2 = ggml_new_graph(c.get()); ggml_graph_add_node(graph2,y2);
+    auto * y2 = ggml_dup(c.get(),ggml_mul_mat(c.get(),w,x2));
+    auto * graph2 = ggml_new_graph(c.get()); ggml_build_forward_expand(graph2,y2);
     buffer_ptr b(ggml_backend_alloc_ctx_tensors(c.get(),backend.get()),ggml_backend_buffer_free);
     CHECK(b); if (!b) { return; }
     std::vector<float> identity(32*32);
@@ -323,9 +323,9 @@ static void weight_reuse_test(ggml_backend_dev_t device) {
     ggml_backend_tensor_set(a,raw_a.data(),0,raw_a.size());ggml_backend_tensor_set(b,raw_b.data(),0,raw_b.size());
     auto * x_a=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,2);
     auto * x_b=ggml_new_tensor_2d(c.get(),GGML_TYPE_F32,32,2);
-    auto * y_a=ggml_mul_mat(c.get(),a,x_a);auto * y_b=ggml_mul_mat(c.get(),b,x_b);
-    auto * g_a=ggml_new_graph(c.get());ggml_graph_add_node(g_a,y_a);
-    auto * g_b=ggml_new_graph(c.get());ggml_graph_add_node(g_b,y_b);
+    auto * y_a=ggml_dup(c.get(),ggml_mul_mat(c.get(),a,x_a));auto * y_b=ggml_dup(c.get(),ggml_mul_mat(c.get(),b,x_b));
+    auto * g_a=ggml_new_graph(c.get());ggml_build_forward_expand(g_a,y_a);
+    auto * g_b=ggml_new_graph(c.get());ggml_build_forward_expand(g_b,y_b);
     buffer_ptr io(ggml_backend_alloc_ctx_tensors(c.get(),backend.get()),ggml_backend_buffer_free);
     CHECK(io); if (!io) { return; }
     std::vector<float> input(64);input[0]=1;input[33]=1;

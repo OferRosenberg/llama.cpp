@@ -1,5 +1,9 @@
 # QAIRT backend: FP16 HTP implementation
 
+## Native library and CLI execution
+
+Qwen3-0.6B can run through ordinary library calls and llama-cli without harness callbacks. Supported operations run on HTP with normal CPU fallback. See [native library and CLI usage](QAIRT-native.md) for the current setup and execution limits. The historical fixture results below retain their original scope and accuracy exceptions.
+
 ## Accepted qualification for progression
 
 On November 19, 2026, the user accepted the FP16-emulated short/long results as sufficient qualification to move to the next development steps. This acceptance applies to the current Qwen3 block-27 plus final-normalization HTP fixture.
@@ -54,7 +58,7 @@ Quantized fused MaskSoftmax is not assumed. Mask -infinity becomes -65504, with 
 
 ## Buffers, preparation and state
 
-Original GGML buffers preserve their source representations, including Q4_0/Q4_1 bytes. QAIRT storage is aligned host-accessible memory. It reports is_host=true by default; W4FP16 mode reports is_host=false to require upload callbacks during model loading, with ordinary GGML transfers for CPU consumers. Validated host buffer types, including CPU buffers, are accepted directly by the scheduler. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
+Original GGML buffers preserve their source representations, including Q4_0/Q4_1 bytes. QAIRT storage is aligned host-accessible memory. It reports is_host=true by default; W4FP16 mode reports is_host=false to require upload callbacks during model loading, with ordinary GGML transfers for CPU consumers. The scheduler accepts QAIRT buffer types directly. Ordinary CPU buffers use normal scheduler copies; validated host tensors remain readable for staging. Opaque source buffers require ordinary GGML copies. Pinned allocation, host-pointer import, mmap, registered/shared memory, async execution and events are not advertised.
 
 Default Q4_0/Q4_1 rows decode through GGML type traits with bounded F32 scratch and FP16 staging. W4FP16 mode repacks eligible weights into immutable buffer-owned signed-byte/block-metadata sidecars during upload; graph-local metadata copies prevent SDK registration from mutating shared state. Graph construction reuses sidecars and keeps FP16 fallback for other sources. Dynamic numerical inputs convert directly to FP16 for every execution. Tracked QAIRT WEIGHTS allocations can supply STATIC QNN data. Allocation identity/generation/offset enter preparation identity; mutations force reprepare. Untracked sources are rebound as APP_WRITE. STATIC registration uses the released API's copied-payload contract.
 
@@ -114,7 +118,7 @@ The short/long FP16 reference controls match exactly. All local projection NMSE 
 
 ## M2 Full FP16 all-block checkpoint
 
-The November 19, 2026 all-block fixture covers all 28 Qwen3 blocks (0-27), using per-block scheduler cuts to respect the 128-GGML-node partition limit. This does not qualify unrestricted full-model CLI offload. Numerical QNN weights, activations and intermediates remain FP16; positions and indices remain integer metadata.
+The November 19, 2026 all-block fixture covers all 28 Qwen3 blocks (0-27), using per-block scheduler cuts to respect the 128-GGML-node partition limit. That fixture alone does not qualify unrestricted full-model CLI offload; the later Qwen3-0.6B native-path checks are documented separately in QAIRT-native.md. Numerical QNN weights, activations and intermediates remain FP16; positions and indices remain integer metadata.
 
 With `--fused --fp16-reference --offload-last all --decode-steps 20 --prompt 'Explain how rain forms. Write three complete sentences.'`, hybrid and FP16-emulated CPU execution produce identical 20-token greedy output across 22 frames. Reset is exactly reproducible. All 4,246 local projection comparisons pass; worst local NMSE is 8.82395592e-9 against 1e-5. Worst logit maxabs is 0.445525169 against 0.75.
 

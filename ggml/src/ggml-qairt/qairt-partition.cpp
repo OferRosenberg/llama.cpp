@@ -34,7 +34,7 @@ bool constant_tensor(const ggml_tensor * t, const std::vector<pending_output> & 
     const auto begin = reinterpret_cast<uintptr_t>(t->data);
     for (const auto & output : pending) {
         const auto other = reinterpret_cast<uintptr_t>(output.tensor->data);
-        if ((other >= begin && other - begin < ggml_nbytes(t)) || (begin > other && begin - other < output.bytes.size())) { return false; }
+        if ((other >= begin && other - begin < ggml_nbytes(t)) || (begin > other && begin - other < ggml_nbytes(output.tensor))) { return false; }
     }
     return true;
 }
@@ -67,7 +67,7 @@ class partition_builder final {
 public:
     partition_builder(prepared_run & entry, const std::vector<ggml_tensor *> & nodes, const tensor_inventory & inventory,
                       std::function<std::vector<fp16_bits>(const ggml_tensor *)> pack,
-                      const std::vector<pending_output> & pending, bool w4fp16, bool app_write_weights) : w4fp16_(w4fp16), app_write_weights_(app_write_weights), entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending) {
+                      const std::vector<pending_output> & pending, const std::vector<bool> & exports, bool w4fp16, bool app_write_weights) : w4fp16_(w4fp16), app_write_weights_(app_write_weights), entry_(entry), nodes_(nodes), inventory_(inventory), pack_(std::move(pack)), pending_(pending), exports_(exports) {
         for (const auto * t : nodes) { members_[t] = true; }
     }
     void lower() {
@@ -75,8 +75,8 @@ public:
             auto * t = nodes_[i];
             const size_t first_op=entry_.partition->qnn_nodes;
             if (metadata_op(t->op)) { continue; }
-            const auto y = tensor(logical_shape(t), QNN_TENSOR_TYPE_APP_READ);
-            entry_.outputs.push_back(y); entry_.partition->output_nodes.push_back(i);
+            const auto y = tensor(logical_shape(t), exports_[i] ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE);
+            if (exports_[i]) { entry_.outputs.push_back(y); entry_.partition->output_nodes.push_back(i); }
             const auto packed = t->op == GGML_OP_MUL_MAT ? native_weights(t->src[0]) : nullptr;
             auto a = packed ? null_tensor_id : input(t->src[0]);
             if (packed) { native_matmul(t,*packed,y); }
@@ -340,6 +340,7 @@ private:
     const tensor_inventory & inventory_;
     std::function<std::vector<fp16_bits>(const ggml_tensor *)> pack_;
     const std::vector<pending_output> & pending_;
+    const std::vector<bool> & exports_;
     std::unordered_map<const ggml_tensor *,bool> members_;
     std::unordered_map<const ggml_tensor *,tensor_id> values_;
     std::vector<std::pair<const ggml_tensor *,tensor_id>> state_;
@@ -347,10 +348,11 @@ private:
 };
 }
 
-status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,std::vector<pending_output> & pending) {
+status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,const std::vector<bool> & exports,std::vector<pending_output> & pending) {
     try {
         tensor_inventory inventory(nodes);
-        std::vector<uint64_t> key {0x504152544954494fULL,3,uint64_t(runtime_->config().enable_w4fp16),uint64_t(runtime_->config().app_write_weights),uint64_t(runtime_->config().share_weight_graphs),nodes.size(),inventory.tensors.size()};
+        std::vector<uint64_t> key {0x504152544954494fULL,4,uint64_t(runtime_->config().enable_w4fp16),uint64_t(runtime_->config().app_write_weights),uint64_t(runtime_->config().share_weight_graphs),nodes.size(),inventory.tensors.size()};
+        for (bool exported : exports) { key.push_back(exported); }
         for (const auto * t:inventory.tensors) {
             key.push_back(t->op);key.push_back(t->type);key.push_back(t->view_offs);
             for(size_t i=0;i<4;++i){key.push_back(t->ne[i]);key.push_back(t->nb[i]);}
@@ -376,16 +378,9 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
             } else { graph_context = checked(context_owner::create(runtime_)); }
             const auto graph_name = runtime_->config().shared_context ? "connected_partition_" + std::to_string(++next_graph_name_) : "connected_partition";
             fresh->graph=checked(graph_owner::create(std::move(graph_context),graph_name));
-            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,runtime_->config().enable_w4fp16,runtime_->config().app_write_weights);
+            partition_builder builder(*fresh,nodes,inventory,[&](const ggml_tensor * t){return checked(pack(t,pending));},pending,exports,runtime_->config().enable_w4fp16,runtime_->config().app_write_weights);
             builder.lower();
             if(!reserve_cache(fresh->static_bytes)){throw partition_error("Static partition payload exceeds cache limit");}
-            if (diagnostic_phase()) {
-                uint64_t retained_bytes = 0;
-                for (const auto & cached : cache_) { retained_bytes += cached->static_bytes; }
-                GGML_LOG_INFO("qairt: inventory partition phase=%s graph=%llu cache_entries=%zu cache_static_bytes=%llu candidate_static_bytes=%zu first=%s last=%s ggml=%zu qnn=%zu w4=%zu\n",
-                    diagnostic_phase(), (unsigned long long) fresh->graph->diagnostic_id(), cache_.size(), (unsigned long long) retained_bytes,
-                    fresh->static_bytes, ggml_get_name(nodes.front()), ggml_get_name(nodes.back()), nodes.size(), fresh->partition->qnn_nodes, fresh->partition->w4_matmuls);
-            }
             const auto finalization_start = std::chrono::steady_clock::now();
             const auto finalized = fresh->graph->finalize();
             const auto preparation_end = std::chrono::steady_clock::now();
@@ -442,9 +437,23 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
             }}
         }
         auto binding=checked(execution_binding::create(entry->graph));
-        std::vector<std::vector<uint8_t>> inputs;inputs.reserve(entry->partition->inputs.size());
+        auto & inputs = entry->partition->input_buffers;
+        inputs.resize(entry->partition->inputs.size());
+        size_t input_index = 0;
         for(const auto & input:entry->partition->inputs) {
-            const auto * t=inventory.tensors[input.slot];std::vector<uint8_t> bytes;
+            const auto * t=inventory.tensors[input.slot];
+            auto & bytes = inputs[input_index++];
+            if (input.kind == partition_input_kind::numerical) {
+                if (const auto * payload = retained_fp16(t, pending)) {
+                    checked(binding->bind_input(input.id, {payload, size_t(ggml_nelements(t)) * 2}));
+                    ++stats_.fp16_handoffs;
+                    continue;
+                }
+                if (!runtime_->config().validate_numerics && !pending_alias(t, pending) && t->type == GGML_TYPE_F16 && ggml_is_contiguous(t)) {
+                    checked(binding->bind_input(input.id, {t->data, size_t(ggml_nelements(t)) * 2}));
+                    continue;
+                }
+            }
             if(input.kind==partition_input_kind::cosine || input.kind==partition_input_kind::sine) {
                 const auto & payload=selected_tables.at(input.id.value);bytes.resize(payload.size()*2);std::memcpy(bytes.data(),payload.data(),bytes.size());
             }else if(input.kind==partition_input_kind::indices || input.kind==partition_input_kind::scatter_indices) {
@@ -473,28 +482,36 @@ status backend_context::run_partition(const std::vector<ggml_tensor *> & nodes,s
                         payload[row*columns+col].bits=ggml_fp32_to_fp16(value);
                     }if(!finite){throw partition_error("Softmax row has no unmasked value");}
                 }bytes.resize(payload.size()*2);std::memcpy(bytes.data(),payload.data(),bytes.size());
-            }else{auto payload=checked(pack(t,pending));bytes.resize(payload.size()*2);std::memcpy(bytes.data(),payload.data(),bytes.size());}
-            inputs.push_back(std::move(bytes));checked(binding->bind_input(input.id,{inputs.back().data(),inputs.back().size()}));
+            }else{bytes=checked(numerical_bytes(t,pending));}
+            checked(binding->bind_input(input.id,{bytes.data(),bytes.size()}));
         }
-        std::vector<std::vector<fp16_bits>> outputs;outputs.reserve(entry->outputs.size());
-        for(size_t i=0;i<entry->outputs.size();++i){outputs.emplace_back(size_t(ggml_nelements(nodes[entry->partition->output_nodes[i]])));
-            checked(binding->bind_output(entry->outputs[i],{outputs.back().data(),outputs.back().size()*2}));}
+        auto & outputs = entry->partition->output_buffers;
+        outputs.resize(entry->outputs.size());
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            // A reused graph cannot overwrite a still-live predecessor buffer.
+            if (!outputs[i] || outputs[i].use_count() > 1) { outputs[i] = std::make_shared<std::vector<fp16_bits>>(); }
+            outputs[i]->resize(size_t(ggml_nelements(nodes[entry->partition->output_nodes[i]])));
+            checked(binding->bind_output(entry->outputs[i], {outputs[i]->data(), outputs[i]->size() * 2}));
+        }
         checked(entry->graph->execute(*binding));++stats_.executions;stats_.w4_executions+=entry->partition->w4_matmuls;
-        for(size_t i=0;i<outputs.size();++i){auto * t=nodes[entry->partition->output_nodes[i]];std::vector<uint8_t> bytes(dense_bytes(t));
-            for(size_t j=0;j<outputs[i].size();++j){const float value=ggml_fp16_to_fp32(outputs[i][j].bits);
-                if(!std::isfinite(value)){throw partition_error("Nonfinite partition output");}
-                if(t->type==GGML_TYPE_F32){std::memcpy(bytes.data()+j*4,&value,4);}else{std::memcpy(bytes.data()+j*2,&outputs[i][j].bits,2);}}
-            if(t->op==GGML_OP_SET_ROWS) {
+        stats_.exported_tensors += outputs.size();
+        for(size_t i=0;i<outputs.size();++i){auto * t=nodes[entry->partition->output_nodes[i]];
+            if (runtime_->config().validate_numerics) {
+                for (const auto half : *outputs[i]) {
+                    if (!std::isfinite(ggml_fp16_to_fp32(half.bits))) { throw partition_error("Nonfinite partition output"); }
+                }
+            }
+            if(runtime_->config().validate_numerics && t->op==GGML_OP_SET_ROWS) {
                 const auto * cache=t->src[2];const auto * indices=t->src[1];const size_t rows=size_t(cache->ne[1]),width=size_t(cache->ne[0]);
                 auto original=checked(pack(cache,pending));std::vector<bool> updated(rows,false);
                 std::vector<uint8_t> raw(size_t(indices->ne[0])*ggml_type_size(indices->type));ggml_backend_tensor_get(indices,raw.data(),0,raw.size());
                 for(size_t j=0;j<size_t(indices->ne[0]);++j){int64_t value;
                     if(indices->type==GGML_TYPE_I64){std::memcpy(&value,raw.data()+j*8,8);}else{int32_t v;std::memcpy(&v,raw.data()+j*4,4);value=v;}updated[size_t(value)]=true;}
                 for(size_t row=0;row<rows;++row){if(!updated[row]){for(size_t col=0;col<width;++col){
-                    if(original[row*width+col].bits!=outputs[i][row*width+col].bits){throw partition_error("KV scatter modified untouched row");}
+                    if(original[row*width+col].bits!=(*outputs[i])[row*width+col].bits){throw partition_error("KV scatter modified untouched row");}
                 }}}
             }
-            pending.push_back({t,std::move(bytes)});
+            pending.push_back({t,outputs[i]});
         }
         return status::success();
     }catch(const qairt_error & error){return status::failure(error);}

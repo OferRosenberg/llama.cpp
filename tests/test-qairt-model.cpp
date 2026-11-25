@@ -8,7 +8,6 @@
 #include "qairt-fp16-reference.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,16 +22,8 @@ using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
 using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); } } while (0)
-static std::atomic<bool> qnn_log_phase {false};
-static bool set_probe_phase(const char * phase) {
-#ifdef _WIN32
-    return _putenv_s("GGML_QAIRT_DIAGNOSTIC_PHASE", phase ? phase : "") == 0;
-#else
-    return phase ? setenv("GGML_QAIRT_DIAGNOSTIC_PHASE", phase, 1) == 0 : unsetenv("GGML_QAIRT_DIAGNOSTIC_PHASE") == 0;
-#endif
-}
 static void logger(ggml_log_level level, const char * text, void *) {
-    if ((qnn_log_phase.load() && std::strstr(text, "qairt:")) || std::strstr(text, "qairt: inventory") || level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
+    if (level == GGML_LOG_LEVEL_ERROR || std::strstr(text, "rejected ") || std::strstr(text, "qairt: executing") || std::strstr(text, "qairt: connected graph") || std::strstr(text, "qairt: partition span") || std::strstr(text, "qairt: W4FP16 initialized")) { std::fputs(text, stderr); }
 }
 struct observation;
 static bool observe(ggml_tensor *, bool, void *);
@@ -338,13 +329,12 @@ static void compare_activation_edges(const observation & cpu, const observation 
                     label, item.first.c_str(), input.nmse, packed.nmse, changed);
     }
 }
-struct options { bool control = false, all = true, fused = false, fp16 = false, prepare_probe = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt; };
+struct options { bool control = false, all = true, fused = false, fp16 = false; int layers = 1, prefill = 0, tail = 0, steps = 8, capacity = 1024; std::string prompt; };
 static bool parse(int argc, char ** argv, options & options) {
     try {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--fp16-reference") { options.fp16 = true; continue; }
-            if (arg == "--qnn-prepare-probe") { options.prepare_probe = true; continue; }
             if (arg == "--fused") { options.fused = true; continue; }
             if (arg == "--cpu-control") { options.control = true; continue; }
             if (i + 1 >= argc) { return false; }
@@ -417,10 +407,9 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--fp16-reference-self-test") == 0) { return fp16_reference_self_test(); }
     options opt;
     if (argc < 2 || !parse(argc, argv, opt)) {
-        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--qnn-prepare-probe] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024]\n");
+        std::fprintf(stderr, "Usage: test-qairt-model MODEL [--cpu-control] [--fused] [--fp16-reference] [--offload-last N|all] [--ops all|projections] [--prefill 128] [--tail 13] [--decode-steps N] [--prompt TEXT] [--ctx 1024]\n");
         return 2;
     }
-    if (opt.prepare_probe) { CHECK(set_probe_phase("init")); }
     llama_log_set(logger, nullptr); ggml_log_set(logger, nullptr); ggml_backend_load_all(); llama_backend_init();
     ggml_backend_dev_t cpu_devices[] = {nullptr};
     auto mp = llama_model_default_params(); mp.devices = cpu_devices; mp.n_gpu_layers = 0;
@@ -500,17 +489,7 @@ int main(int argc, char ** argv) {
             }
         }
         if (executed) { CHECK(executed->projections.empty() && executed->others == 0); }
-        if (opt.prepare_probe) {
-            CHECK(set_probe_phase(label));
-            qnn_log_phase.store(std::strcmp(label, "decode0") == 0);
-            std::fprintf(stderr, "qairt: inventory phase_begin phase=%s\n", label);
-        }
         const int actual_status = decode(actual_ctx.get(), input, position);
-        if (opt.prepare_probe) {
-            std::fprintf(stderr, "qairt: inventory phase_end phase=%s status=%d\n", label, actual_status);
-            qnn_log_phase.store(false);
-            CHECK(set_probe_phase("idle"));
-        }
         if (executed) {
             actual_seen.htp_projections = 0; actual_seen.other_htp = executed->others;
             for (const auto & projection : executed->projections) {
@@ -616,11 +595,6 @@ int main(int argc, char ** argv) {
         const std::string label = "decode" + std::to_string(step);
         next = frame({next}, label.c_str(), true);
         if (decode_failed) { return 1; }
-        if (opt.prepare_probe) {
-            std::printf("QNN preparation probe: prefill_status=0 decode_status=0 decode_steps=1 failures=%d\n", failures);
-            std::fflush(stdout);
-            return failures ? 1 : 0;
-        }
     }
     CHECK(disagreements <= 1);
     std::printf("teacher-forced response: %s\n", response.c_str());

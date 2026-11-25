@@ -8,26 +8,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 
 namespace ggml::qairt {
-
-const char * diagnostic_phase() noexcept {
-    const char * phase = std::getenv("GGML_QAIRT_DIAGNOSTIC_PHASE");
-    return phase && *phase ? phase : nullptr;
-}
-
-status runtime_owner::set_log_level(QnnLog_Level_t level) {
-    if (closed_ || !log_) { return status::failure(host_error(error_stage::logging, "logSetLogLevel", "No live logger")); }
-    const auto code = domain_->call([&](const auto & api) {
-        return api.logSetLogLevel ? api.logSetLogLevel(log_.get(), level) : QNN_COMMON_ERROR_NOT_SUPPORTED;
-    });
-    if (code == QNN_SUCCESS) { log_level_ = level; }
-    if (diagnostic_phase()) {
-        GGML_LOG_INFO("qairt: inventory log_level phase=%s requested=%u code=%llu\n", diagnostic_phase(), unsigned(level), (unsigned long long) code);
-    }
-    return check_qnn(code, error_stage::logging, "logSetLogLevel");
-}
 
 struct dll_module::native_module {
     HMODULE handle = nullptr;
@@ -224,8 +206,8 @@ result<std::shared_ptr<runtime_owner>> runtime_factory::create(
     owner->target_configs_ = std::move(configs).value();
 
     Qnn_LogHandle_t log = nullptr;
-    owner->log_level_ = owner->config_->verbose_diagnostics && !diagnostic_phase() ? QNN_LOG_LEVEL_DEBUG : QNN_LOG_LEVEL_WARN;
-    auto code = domain->call([&](const auto & api) { return api.logCreate(log_callback, owner->log_level_, &log); });
+    const auto log_level = owner->config_->verbose_diagnostics ? QNN_LOG_LEVEL_DEBUG : QNN_LOG_LEVEL_WARN;
+    auto code = domain->call([&](const auto & api) { return api.logCreate(log_callback, log_level, &log); });
     if (code != QNN_SUCCESS) { return runtime_result::failure(sdk_error(error_stage::logging, "logCreate", code)); }
     owner->log_.adopt_into_empty(log, domain);
     Qnn_BackendHandle_t backend = nullptr;

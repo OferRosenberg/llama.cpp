@@ -1,5 +1,7 @@
 # QAIRT backend
 
+Normal llama.cpp library and CLI execution is supported for the Qwen3-0.6B checkpoint. See [native library and CLI usage](../../../docs/backend/QAIRT-native.md) for runtime setup, query commands and public API configuration.
+
 Current connected-graph checkpoint: shared qairt-partition.cpp lowering joins operators, branches, layout transforms and KV ScatterNd. Block 27 plus final norm/scale execute once per shape profile in --fused Qwen3 validation. Numerical QNN tensors are FP16 by default. Opt-in `GGML_QAIRT_W4FP16=1` supplies native block-quantized Q4_0/Q4_1 projection weights with FP16 activations and outputs. Functional suites pass; model local/intermediate accuracy remains unresolved. See docs/backend/QAIRT.md.
 
 
